@@ -58,7 +58,7 @@ class GTSAM_EXPORT QpCost : public NonlinearFactor {
    * factor.
    */
   explicit QpCost(const GaussianFactor::shared_ptr& factor)
-      : QpCost(factor ? *factor
+      : QpCost(factor ? HessianFactor(*factor)
                       : throw std::invalid_argument(
                             "QpCost: shared Gaussian factor is null.")) {}
 
