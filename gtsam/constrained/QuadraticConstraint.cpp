@@ -19,7 +19,9 @@
 #include <gtsam/constrained/QuadraticConstraint.h>
 #include <gtsam/nonlinear/Values.h>
 
+#include <algorithm>
 #include <stdexcept>
+#include <vector>
 
 namespace gtsam {
 namespace {
@@ -48,19 +50,43 @@ Matrix VectorOrMatrixAsMatrix(const Values& values, Key key) {
 /* ************************************************************************* */
 Vector ConstraintError(const QuadraticConstraint& constraint,
                        const Values& values, OptionalMatrixVecType H) {
-  const Matrix X = VectorOrMatrixAsMatrix(values, constraint.key());
-  if (X.rows() != constraint.A().rows()) {
-    throw std::invalid_argument(
-        "QuadraticConstraint: value dimension does not match A.");
+  std::vector<Matrix> blocks;
+  DenseIndex totalRows = 0;
+  DenseIndex columns = 0;
+  for (Key key : constraint.keys()) {
+    Matrix block = VectorOrMatrixAsMatrix(values, key);
+    if (columns && block.cols() != columns) {
+      throw std::invalid_argument("QuadraticConstraint: column counts differ.");
+    }
+    columns = block.cols();
+    totalRows += block.rows();
+    blocks.push_back(std::move(block));
   }
-
+  if (totalRows != constraint.A().rows()) {
+    throw std::invalid_argument(
+        "QuadraticConstraint: stacked value dimension does not match A.");
+  }
+  Matrix X(totalRows, columns);
+  DenseIndex offset = 0;
+  for (const Matrix& block : blocks) {
+    X.middleRows(offset, block.rows()) = block;
+    offset += block.rows();
+  }
   const Matrix AX = constraint.A() * X;
   const double sign = SenseSign(constraint.sense());
   if (H) {
+    H->resize(blocks.size());
     const Matrix gradient =
         sign * (constraint.A() + constraint.A().transpose()) * X;
-    const Eigen::Map<const Vector> vectorized(gradient.data(), gradient.size());
-    (*H)[0] = vectorized.transpose();
+    offset = 0;
+    for (size_t index = 0; index < blocks.size(); ++index) {
+      const Matrix blockGradient =
+          gradient.middleRows(offset, blocks[index].rows());
+      const Eigen::Map<const Vector> vectorized(blockGradient.data(),
+                                                blockGradient.size());
+      (*H)[index] = vectorized.transpose();
+      offset += blocks[index].rows();
+    }
   }
   return Vector1(sign * ((X.transpose() * AX).trace() - constraint.b()));
 }
@@ -68,9 +94,17 @@ Vector ConstraintError(const QuadraticConstraint& constraint,
 }  // namespace
 
 /* ************************************************************************* */
-QuadraticConstraint::QuadraticConstraint(Key key, const Matrix& A, double b,
-                                         Sense sense, double sigma)
-    : key_(key), A_(A), b_(b), sense_(sense), sigma_(sigma) {
+QuadraticConstraint::QuadraticConstraint(const KeyVector& keys, const Matrix& A,
+                                         double b, Sense sense, double sigma)
+    : keys_(keys), A_(A), b_(b), sense_(sense), sigma_(sigma) {
+  if (keys_.empty()) {
+    throw std::invalid_argument("QuadraticConstraint: keys must not be empty.");
+  }
+  KeyVector sorted = keys_;
+  std::sort(sorted.begin(), sorted.end());
+  if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+    throw std::invalid_argument("QuadraticConstraint: keys must be unique.");
+  }
   if (A_.rows() != A_.cols()) {
     throw std::invalid_argument("QuadraticConstraint: A must be square.");
   }

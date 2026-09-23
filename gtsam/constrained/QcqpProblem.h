@@ -39,9 +39,8 @@ struct HasQcqpVariableTraits : std::false_type {};
 template <typename T, int D>
 struct HasQcqpVariableTraits<
     T, D,
-    std::void_t<
-        decltype(traits<T>::template QcqpValue<D>(std::declval<T>())),
-        decltype(traits<T>::template QcqpConstraints<D>())>>
+    std::void_t<decltype(traits<T>::template QcqpValue<D>(std::declval<T>())),
+                decltype(traits<T>::template QcqpConstraints<D>())>>
     : std::true_type {};
 
 template <typename T, int D, typename = void>
@@ -114,7 +113,7 @@ void InsertQcqpConstraints(Key key, NonlinearEqualityConstraints* constraints) {
           dynamic_cast<const QuadraticEqualityConstraintFactor*>(factor.get());
       if (!quadratic) continue;
       const QuadraticConstraint& existing = quadratic->quadraticConstraint();
-      if (existing.key() == key && existing.A().isApprox(A, 0.0) &&
+      if (existing.keys() == KeyVector{key} && existing.A().isApprox(A, 0.0) &&
           existing.b() == b && existing.sigma() == 1.0) {
         alreadyPresent = true;
         break;
