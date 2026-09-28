@@ -45,6 +45,7 @@
 #include <limits>
 #include <set>
 #include <stdexcept>
+#include <string>
 
 namespace gtsam {
 namespace {
@@ -53,6 +54,16 @@ using Clock = std::chrono::steady_clock;
 
 double ElapsedSeconds(Clock::time_point start) {
   return std::chrono::duration<double>(Clock::now() - start).count();
+}
+
+void RequireUnaryQuadraticConstraint(const QuadraticConstraint& constraint,
+                                     const char* operation) {
+  if (constraint.keys().size() != 1) {
+    throw std::invalid_argument(
+        std::string(operation) +
+        ": Riemannian staircase currently supports only unary quadratic "
+        "constraints.");
+  }
 }
 
 }  // namespace
@@ -345,6 +356,7 @@ Eigen::SparseMatrix<double> RiemannianStaircaseOptimizer::buildMultiplierMatrix(
           "QuadraticEqualityConstraintFactor.");
     }
     const QuadraticConstraint& qc = qcFactor->quadraticConstraint();
+    RequireUnaryQuadraticConstraint(qc, "buildMultiplierMatrix");
     if (lambdaEq[m].size() != 1) {
       throw std::runtime_error(
           "buildMultiplierMatrix: QuadraticEqualityConstraintFactor expects a "
@@ -416,6 +428,7 @@ RiemannianStaircaseOptimizer::leastSquaresMultipliers(
           "QuadraticEqualityConstraintFactor.");
     }
     const QuadraticConstraint& constraint = quadratic->quadraticConstraint();
+    RequireUnaryQuadraticConstraint(constraint, "leastSquaresMultipliers");
     const Key key = constraint.key();
     const size_t rowDim = layout.rowDimOf(key);
     const Matrix& A = constraint.A();

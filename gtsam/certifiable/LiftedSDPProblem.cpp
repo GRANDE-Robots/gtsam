@@ -48,6 +48,9 @@ using LiftedVariableXijToSDPVariableViewMap =
 
 // Recognize an exact, possibly scaled h^2=1 equality.
 bool isUnitHomogeneousConstraint(const QuadraticConstraint& constraint) {
+  if (constraint.keys().size() != 1) {
+    return false;
+  }
   const Matrix& A = constraint.A();
   if (!constraint.isEquality() || A.size() == 0 || constraint.b() == 0.0 ||
       !std::isfinite(constraint.b()) || A(0, 0) != constraint.b()) {
@@ -475,6 +478,11 @@ mf::Expression::t BuildObjective(
 void AddQuadraticConstraint(
     const mf::Model::t& M, const QuadraticConstraint& constraint,
     const LiftedVariableXijToSDPVariableViewMap& xijMap) {
+  if (constraint.keys().size() != 1) {
+    throw std::invalid_argument(
+        "AddQuadraticConstraint: lifted SDP currently supports only unary "
+        "quadratic constraints.");
+  }
   const Key key = constraint.key();
   // Lower trace(X_i' A X_i) ~ b to the affine SDP constraint <A, Y_ii> ~ b.
   const auto Xii = xijMap.at({key, key})->asExpr();
