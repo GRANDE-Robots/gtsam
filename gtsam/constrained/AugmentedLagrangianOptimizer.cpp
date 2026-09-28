@@ -18,6 +18,9 @@
  */
 
 #include <gtsam/constrained/AugmentedLagrangianOptimizer.h>
+#include <gtsam/constrained/QuadraticConstraint.h>
+#include <gtsam/base/GenericValue.h>
+#include <gtsam/linear/HessianFactor.h>
 #include <gtsam/linear/GaussianFactorGraph.h>
 
 #include <algorithm>
@@ -30,6 +33,69 @@ using std::cout, std::endl, std::setprecision, std::setw;
 
 namespace gtsam {
 namespace {
+
+/**
+ * Preserve exact quadratic-constraint curvature in the LM local model.
+ * Gauss--Newton drops residual*Hessian(h), material for affine epigraph
+ * objectives. Error and gradient stay unchanged; LM damps and accepts its
+ * step against the actual nonlinear merit function.
+ */
+GaussianFactor::shared_ptr AddQuadraticCurvature(
+    const GaussianFactor::shared_ptr& gaussian,
+    const QuadraticConstraint& constraint, const Values& values,
+    double coefficient) {
+  HessianFactor base(*gaussian);
+  Matrix augmented = base.augmentedInformation();
+  std::vector<DenseIndex> rows, columns, dimensions;
+  for (Key key : constraint.keys()) {
+    const Value& value = values.at(key);
+    if (const auto* vector = dynamic_cast<const GenericValue<Vector>*>(&value)) {
+      rows.push_back(vector->value().size());
+      columns.push_back(1);
+    } else if (const auto* matrix =
+                   dynamic_cast<const GenericValue<Matrix>*>(&value)) {
+      rows.push_back(matrix->value().rows());
+      columns.push_back(matrix->value().cols());
+    } else {
+      throw std::invalid_argument("quadratic curvature needs vector/matrix values");
+    }
+    dimensions.push_back(rows.back() * columns.back());
+  }
+  DenseIndex rowOffset = 0, valueRowOffset = 0;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    DenseIndex colOffset = 0, valueColOffset = 0;
+    for (size_t j = 0; j < rows.size(); ++j) {
+      if (columns[i] != columns[j])
+        throw std::invalid_argument("quadratic curvature column counts differ");
+      const Matrix block =
+          constraint.A().block(rowOffset, colOffset, rows[i], rows[j]) +
+          constraint.A().block(colOffset, rowOffset, rows[j], rows[i]).transpose();
+      for (DenseIndex column = 0; column < columns[i]; ++column)
+        augmented.block(valueRowOffset + column * rows[i],
+                        valueColOffset + column * rows[j], rows[i], rows[j]) +=
+            coefficient * block;
+      colOffset += rows[j];
+      valueColOffset += dimensions[j];
+    }
+    rowOffset += rows[i];
+    valueRowOffset += dimensions[i];
+  }
+  std::vector<Matrix> blocks;
+  std::vector<Vector> linear;
+  DenseIndex offset = 0;
+  for (size_t i = 0; i < dimensions.size(); ++i) {
+    DenseIndex second = offset;
+    for (size_t j = i; j < dimensions.size(); ++j) {
+      blocks.push_back(augmented.block(
+          offset, second, dimensions[i], dimensions[j]));
+      second += dimensions[j];
+    }
+    linear.push_back(augmented.block(offset, valueRowOffset, dimensions[i], 1));
+    offset += dimensions[i];
+  }
+  return std::make_shared<HessianFactor>(
+      constraint.keys(), blocks, linear, augmented(valueRowOffset, valueRowOffset));
+}
 
 /**
  * A factor that adds a constant bias term to an original factor's unwhitened
@@ -81,6 +147,17 @@ class BiasedFactor : public NoiseModelFactor {
       const Values& values,
       gtsam::OptionalMatrixVecType jacobians = nullptr) const override {
     return originalFactor_->unwhitenedError(values, jacobians) + bias_;
+  }
+
+  GaussianFactor::shared_ptr linearize(const Values& values) const override {
+    auto gaussian = Base::linearize(values);
+    const auto* quadratic =
+        dynamic_cast<const QuadraticEqualityConstraintFactor*>(originalFactor_.get());
+    if (!quadratic) return gaussian;
+    const double sigma = noiseModel()->sigmas()(0);
+    const double coefficient = unwhitenedError(values)(0) / (sigma * sigma);
+    return AddQuadraticCurvature(
+        gaussian, quadratic->quadraticConstraint(), values, coefficient);
   }
 
   /// Print the biased factor.
@@ -171,6 +248,22 @@ class PhrInequalityFactor : public NoiseModelFactor {
       }
     }
     return Vector1(shifted / sqrtPenalty);
+  }
+
+  GaussianFactor::shared_ptr linearize(const Values& values) const override {
+    auto gaussian = Base::linearize(values);
+    const auto* quadratic =
+        dynamic_cast<const QuadraticInequalityConstraintFactor*>(constraint_.get());
+    if (!quadratic) return gaussian;
+    const double shifted =
+        lambda_ + penalty_ * constraint_->whitenedExpr(values)(0);
+    if (shifted <= 0.0) return gaussian;
+    const auto& specification = quadratic->quadraticConstraint();
+    const double sign =
+        specification.sense() == QuadraticConstraint::Sense::GreaterEqual ? -1.0 : 1.0;
+    return AddQuadraticCurvature(
+        gaussian, specification, values,
+        shifted * sign / specification.sigma());
   }
 
   /// Return a deep copy.
@@ -355,6 +448,10 @@ AugmentedLagrangianOptimizer::iterate(const State& state, double muEq,
     // The paper stops its projected inner solve when the projected gradient is
     // at most omega_k. Because this implementation substitutes unconstrained
     // LM, it uses s_k=||grad_x L_rho(x,lambda_k)||_inf <= omega_k.
+    // Solving more tightly than the declared terminal stationarity target
+    // can exhaust finite precision before feasibility can be improved.
+    subproblemState.bclOmega = std::max(
+        subproblemState.bclOmega, p_->absoluteStationarityTolerance);
     while (stationarity > subproblemState.bclOmega &&
            optimizer->iterations() < p_->lmParams.maxIterations) {
       const size_t previousIterations = optimizer->iterations();
@@ -382,6 +479,7 @@ AugmentedLagrangianOptimizer::iterate(const State& state, double muEq,
   solvedState.totalUnconstrainedIterations =
       state.totalUnconstrainedIterations + solvedState.unconstrainedIterations;
   solvedState.augmentedLagrangianStationarity = stationarity;
+  solvedState.innerStationarityTolerance = subproblemState.bclOmega;
   const Diagnostics diagnostics =
       EvaluateDiagnostics(problem_, solvedState.values, subproblemState);
   solvedState.generalizedConstraintViolation =
@@ -462,6 +560,14 @@ Values AugmentedLagrangianOptimizer::optimize() const {
   // Construct the initial primal-dual state with zero multipliers.
   State state(0, initialValues_, problem_);
   state.initializeLagrangeMultipliers(problem_);
+  if (!p_->initialInequalityMultipliers.empty()) {
+    if (p_->initialInequalityMultipliers.size() != state.lambdaIneq.size() ||
+        !std::all_of(p_->initialInequalityMultipliers.begin(),
+                     p_->initialInequalityMultipliers.end(),
+                     [](double value) { return std::isfinite(value) && value >= 0.0; }))
+      throw std::invalid_argument("initial inequality multipliers do not match constraints");
+    state.lambdaIneq = p_->initialInequalityMultipliers;
+  }
 
   double muEq = p_->initialMuEq;
   double muIneq = p_->initialMuIneq;
