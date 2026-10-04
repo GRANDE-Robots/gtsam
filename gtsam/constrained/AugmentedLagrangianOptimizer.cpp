@@ -22,6 +22,12 @@
 #include <gtsam/base/GenericValue.h>
 #include <gtsam/linear/HessianFactor.h>
 #include <gtsam/linear/GaussianFactorGraph.h>
+#include <gtsam/constrained/QpCost.h>
+#include <typeinfo>
+#include <gtsam/nonlinear/NonlinearMultifrontalSolver.h>
+#include <gtsam/constrained/LinearConstraint.h>
+#include <gtsam/nonlinear/internal/LevenbergMarquardtState.h>
+#include <gtsam/linear/linearExceptions.h>
 
 #include <algorithm>
 #include <chrono>
@@ -273,6 +279,298 @@ class PhrInequalityFactor : public NoiseModelFactor {
   }
 };
 
+// Exact direct-vector QCQP merit differences; generic manifold/noise factors
+// retain the original optimizer. No feasibility or stationarity rule changes.
+struct MeritDifference {
+  long double reduction = 0.0L;
+  long double arithmeticScale = 0.0L;
+  long double correction = 0.0L;
+  long double inheritedError = 0.0L;
+  void add(long double term) {
+    const long double y = term - correction;
+    const long double next = reduction + y;
+    correction = (next - reduction) - y;
+    reduction = next;
+    arithmeticScale += std::abs(term);
+  }
+  bool positive() const {
+    return std::isfinite(reduction) && reduction >
+        inheritedError + 64.0L * std::numeric_limits<long double>::epsilon() * arithmeticScale;
+  }
+};
+
+struct ExpressionIncrement {
+  long double value, increment, valueError, incrementError;
+};
+ExpressionIncrement ScaledIncrement(const MeritDifference& value,
+                                   const MeritDifference& increment,
+                                   long double scale) {
+  const long double epsilon=64.L*std::numeric_limits<long double>::epsilon();
+  return {scale*value.reduction,scale*increment.reduction,
+          std::abs(scale)*epsilon*(value.arithmeticScale+std::abs(value.reduction)),
+          std::abs(scale)*epsilon*(increment.arithmeticScale+std::abs(increment.reduction))};
+}
+long double MeritIncrementError(const ExpressionIncrement& e,
+                               long double multiplier,long double rho) {
+  return rho*std::abs(e.increment)*e.valueError +
+      (std::abs(multiplier)+rho*(std::abs(e.value)+e.valueError+
+       std::abs(e.increment)+e.incrementError))*e.incrementError;
+}
+
+Matrix DirectMatrix(const Values& values, Key key) {
+  const auto& value = values.at(key);
+  if (const auto* v = dynamic_cast<const GenericValue<Vector>*>(&value))
+    return v->value();
+  if (const auto* m = dynamic_cast<const GenericValue<Matrix>*>(&value))
+    return m->value();
+  throw std::invalid_argument("stable QCQP merit requires direct vector/matrix values");
+}
+
+ExpressionIncrement QuadraticIncrement(
+    const QuadraticConstraint& constraint, const Values& oldValues,
+    const Values& newValues) {
+  DenseIndex rows = 0, cols = 0;
+  for (Key key : constraint.keys()) {
+    const Matrix value = DirectMatrix(oldValues, key);
+    rows += value.rows();
+    if (cols && cols != value.cols())
+      throw std::invalid_argument("stable QCQP column mismatch");
+    cols = value.cols();
+  }
+  using Extended = Eigen::Matrix<long double, Eigen::Dynamic, Eigen::Dynamic>;
+  Extended x(rows, cols), d(rows, cols);
+  DenseIndex offset = 0;
+  for (Key key : constraint.keys()) {
+    const Matrix before = DirectMatrix(oldValues, key);
+    const Matrix after = DirectMatrix(newValues, key);
+    if (before.rows()!=after.rows() || before.cols()!=after.cols())
+      throw std::invalid_argument("stable QCQP value shape changed");
+    x.middleRows(offset, before.rows()) = before.cast<long double>();
+    d.middleRows(offset, before.rows()) =
+        after.cast<long double>() - before.cast<long double>();
+    offset += before.rows();
+  }
+  const Matrix& a = constraint.A();
+  MeritDifference value, increment;
+  value.add(-static_cast<long double>(constraint.b()));
+  for (DenseIndex col=0; col<cols; ++col)
+    for (DenseIndex i=0; i<rows; ++i)
+      for (DenseIndex j=0; j<rows; ++j) {
+        value.add(x(i,col)*a(i,j)*x(j,col));
+        increment.add(d(i,col)*a(i,j)*x(j,col));
+        increment.add(x(i,col)*a(i,j)*d(j,col));
+        increment.add(d(i,col)*a(i,j)*d(j,col));
+      }
+  const long double scale =
+      (constraint.sense()==QuadraticConstraint::Sense::GreaterEqual ? -1.L : 1.L)
+      / constraint.sigma();
+  return ScaledIncrement(value,increment,scale);
+}
+
+MeritDifference HessianReduction(const HessianFactor& hessian,
+                                 const VectorValues& delta) {
+  MeritDifference result;
+  if (hessian.empty()) return result;
+  const Vector d = delta.vector(hessian.keys());
+  const Matrix augmented = hessian.augmentedInformation();
+  const DenseIndex n = d.size();
+  for (DenseIndex i=0; i<n; ++i) {
+    result.add(static_cast<long double>(augmented(i,n))*d(i));
+    for (DenseIndex j=0; j<n; ++j)
+      result.add(-0.5L*static_cast<long double>(d(i))*augmented(i,j)*d(j));
+  }
+  return result;
+}
+
+std::vector<ExpressionIncrement> LinearIncrement(
+    const LinearConstraint& constraint, const Values& before,
+    const Values& after) {
+  const auto& factor = constraint.factor();
+  const Matrix augmented = factor.augmentedJacobianUnweighted();
+  const Vector b = factor.getb();
+  std::vector<long double> x,d;
+  for (Key key : factor.keys()) {
+    const Matrix old = DirectMatrix(before,key), next = DirectMatrix(after,key);
+    for (DenseIndex col=0; col<old.cols(); ++col)
+      for (DenseIndex row=0; row<old.rows(); ++row) {
+        x.push_back(old(row,col));
+        d.push_back(static_cast<long double>(next(row,col))-old(row,col));
+      }
+  }
+  std::vector<ExpressionIncrement> result;
+  for (DenseIndex row=0; row<b.size(); ++row) {
+    MeritDifference value,increment;
+    value.add(-static_cast<long double>(b(row)));
+    for (size_t col=0; col<x.size(); ++col) {
+      value.add(static_cast<long double>(augmented(row,col))*x[col]);
+      increment.add(static_cast<long double>(augmented(row,col))*d[col]);
+    }
+    const long double sign = constraint.sense()==LinearConstraint::Sense::GreaterEqual ? -1.L : 1.L;
+    const long double scale = sign/constraint.sigmas()(row);
+    result.push_back(ScaledIncrement(value,increment,scale));
+  }
+  return result;
+}
+
+MeritDifference CostReduction(const QpCost& cost, const Values& before,
+                              const Values& after) {
+  const auto& factor=cost.hessianFactor();
+  const Matrix augmented=factor.augmentedInformation();
+  std::vector<long double> x,d;
+  for (Key key : factor.keys()) {
+    const Matrix old=DirectMatrix(before,key),next=DirectMatrix(after,key);
+    for (DenseIndex col=0; col<old.cols(); ++col)
+      for (DenseIndex row=0; row<old.rows(); ++row) {
+        x.push_back(old(row,col));
+        d.push_back(static_cast<long double>(next(row,col))-old(row,col));
+      }
+  }
+  MeritDifference result;
+  for (size_t i=0; i<d.size(); ++i) {
+    result.add(static_cast<long double>(augmented(i,d.size()))*d[i]);
+    for (size_t j=0; j<d.size(); ++j) {
+      result.add(-x[i]*augmented(i,j)*d[j]);
+      result.add(-0.5L*d[i]*augmented(i,j)*d[j]);
+    }
+  }
+  return result;
+}
+
+bool ExactQcqpMerit(const ConstrainedOptProblem& problem) {
+  for (const auto& cost : problem.costs())
+    if (cost && typeid(*cost)!=typeid(QpCost)) return false;
+  for (const auto& c : problem.eConstraints())
+    if (typeid(*c)!=typeid(QuadraticEqualityConstraintFactor) &&
+        typeid(*c)!=typeid(LinearEqualityConstraintFactor)) return false;
+  for (const auto& c : problem.iConstraints())
+    if (typeid(*c)!=typeid(QuadraticInequalityConstraintFactor) &&
+        typeid(*c)!=typeid(LinearInequalityConstraintFactor)) return false;
+  return true;
+}
+
+class StableQcqpLM : public LevenbergMarquardtOptimizer {
+  const ConstrainedOptProblem& problem_;
+  AugmentedLagrangianState subproblem_;
+
+  MeritDifference actualReduction(const Values& before, const Values& after,
+                                  const VectorValues& realized) const {
+    MeritDifference result;
+    for (const auto& cost : problem_.costs()) {
+      if (!cost) continue;
+      const MeritDifference local = CostReduction(*dynamic_cast<const QpCost*>(cost.get()),before,after);
+      result.add(local.reduction);
+      result.arithmeticScale += local.arithmeticScale;
+    }
+    for (size_t i=0; i<problem_.eConstraints().size(); ++i) {
+      const auto* quadratic = dynamic_cast<const QuadraticEqualityConstraintFactor*>(problem_.eConstraints()[i].get());
+      std::vector<ExpressionIncrement> components;
+      if (quadratic) components.push_back(QuadraticIncrement(quadratic->quadraticConstraint(),before,after));
+      else components=LinearIncrement(dynamic_cast<const LinearEqualityConstraintFactor*>(problem_.eConstraints()[i].get())->linearConstraint(),before,after);
+      const long double rho=subproblem_.muEq;
+      for (size_t row=0; row<components.size(); ++row) {
+        const long double h=components[row].value,dh=components[row].increment;
+        result.inheritedError += MeritIncrementError(components[row],subproblem_.lambdaEq[i](row),rho);
+        result.add(-static_cast<long double>(subproblem_.lambdaEq[i](row))*dh);
+        result.add(-rho*h*dh);
+        result.add(-0.5L*rho*dh*dh);
+      }
+    }
+    for (size_t i=0; i<problem_.iConstraints().size(); ++i) {
+      const auto* quadratic = dynamic_cast<const QuadraticInequalityConstraintFactor*>(problem_.iConstraints()[i].get());
+      const auto component = quadratic
+          ? QuadraticIncrement(quadratic->quadraticConstraint(),before,after)
+          : LinearIncrement(dynamic_cast<const LinearInequalityConstraintFactor*>(problem_.iConstraints()[i].get())->linearConstraint(),before,after).at(0);
+      const long double g=component.value,dg=component.increment;
+      const long double rho = subproblem_.muIneq;
+      result.inheritedError += MeritIncrementError(component,subproblem_.lambdaIneq[i],rho);
+      const long double shifted = subproblem_.lambdaIneq[i] + rho*g;
+      const long double next = shifted + rho*dg;
+      if (shifted>0.L && next>0.L) {
+        result.add(-shifted*dg);
+        result.add(-0.5L*rho*dg*dg);
+      } else {
+        const long double oldPositive = std::max(0.L,shifted);
+        const long double newPositive = std::max(0.L,next);
+        result.add((oldPositive-newPositive)*(oldPositive+newPositive)/(2.L*rho));
+      }
+    }
+    return result;
+  }
+
+ public:
+  StableQcqpLM(const NonlinearFactorGraph& graph, const Values& values,
+               const LevenbergMarquardtParams& params,
+               const ConstrainedOptProblem& problem,
+               const AugmentedLagrangianState& subproblem)
+      : LevenbergMarquardtOptimizer(graph,values,params),
+        problem_(problem), subproblem_(subproblem) {}
+
+  GaussianFactorGraph::shared_ptr iterate() override {
+    auto linear = linearize();
+    const bool useMultifrontal = ensureMultifrontalSolver(params_, state_->values);
+    if (useMultifrontal) nonlinearMultifrontalSolver_->load(*linear);
+    VectorValues diagonal;
+    if (params_.dampingParams.diagonalDamping && !useMultifrontal) {
+      diagonal = linear->hessianDiagonal();
+      for (auto& entry : diagonal)
+        entry.second = entry.second.cwiseMax(params_.dampingParams.minDiagonal)
+            .cwiseMin(params_.dampingParams.maxDiagonal).cwiseSqrt();
+    }
+    auto* state = static_cast<internal::LevenbergMarquardtState*>(state_.get());
+    while (true) {
+      const double triedLambda = state->lambda;
+      bool solved = false, accepted = false;
+      MeritDifference predicted, actual;
+      Values next;
+      try {
+        VectorValues proposed;
+        if (useMultifrontal) {
+          nonlinearMultifrontalSolver_->eliminateInPlace(triedLambda);
+          proposed = nonlinearMultifrontalSolver_->updateSolution();
+        } else {
+          proposed = solve(buildDampedSystem(*linear,diagonal),params_);
+        }
+        next = state->values.retract(proposed);
+        const VectorValues realized = state->values.localCoordinates(next);
+        if (realized.norm()>0.0 && std::isfinite(realized.norm())) {
+          solved = true;
+          for (const auto& factor : *linear) {
+            if (!factor) continue;
+            const auto local = HessianReduction(HessianFactor(*factor),realized);
+            predicted.add(local.reduction);
+            predicted.arithmeticScale += local.arithmeticScale;
+          }
+          if (predicted.positive()) {
+            actual = actualReduction(state->values,next,realized);
+            accepted = actual.positive() &&
+                actual.reduction/predicted.reduction>params_.minModelFidelity;
+          }
+        }
+      } catch (const IndeterminateSystemException&) {
+        solved = false;
+      }
+      if (params_.verbosityLM>=LevenbergMarquardtParams::TRYLAMBDA)
+        std::cout << std::setprecision(17) << "stable_qcqp lambda=" << triedLambda
+          << " solved=" << solved << " predicted=" << predicted.reduction
+          << " actual=" << actual.reduction << " accepted=" << accepted << std::endl;
+      if (accepted) {
+        const double newError = graph().error(next);
+        if (!std::isfinite(newError)) return linear;
+        state_ = state->decreaseLambda(params_,
+            static_cast<double>(actual.reduction/predicted.reduction),
+            std::move(next),newError);
+        return linear;
+      }
+      // A rejected cap attempt exhausts the search. Otherwise clamp the next
+      // attempt to the cap, so the configured boundary is actually tried.
+      if (triedLambda>=params_.lambdaUpperBound) return linear;
+      state->increaseLambda(params_);
+      state->lambda = std::min(state->lambda,params_.lambdaUpperBound);
+      if (!(state->lambda>triedLambda)) return linear;
+    }
+  }
+};
+
 struct Diagnostics {
   double generalizedConstraintViolation = 0.0;
   double primalInequalityViolation = 0.0;
@@ -439,8 +737,10 @@ AugmentedLagrangianOptimizer::iterate(const State& state, double muEq,
   // LM from x_k. Multiplier updates happen only after x_{k+1} is available.
   const NonlinearFactorGraph augmentedLagrangian =
       augmentedLagrangianFunction(subproblemState);
-  const SharedOptimizer optimizer =
-      createUnconstrainedOptimizer(augmentedLagrangian, state.values);
+  const SharedOptimizer optimizer = ExactQcqpMerit(problem_)
+      ? std::make_shared<StableQcqpLM>(augmentedLagrangian, state.values,
+                                     p_->lmParams, problem_, subproblemState)
+      : createUnconstrainedOptimizer(augmentedLagrangian, state.values);
 
   double stationarity =
       AugmentedLagrangianStationarity(augmentedLagrangian, optimizer->values());
