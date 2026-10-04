@@ -40,6 +40,31 @@ using std::cout, std::endl, std::setprecision, std::setw;
 namespace gtsam {
 namespace {
 
+void RequireFinite(double value) {
+  if (!std::isfinite(value)) {
+    throw std::runtime_error(
+        "AugmentedLagrangianOptimizer encountered a nonfinite evaluation");
+  }
+}
+
+void RequireFinite(const Vector& vector) {
+  if (!vector.allFinite()) {
+    throw std::runtime_error(
+        "AugmentedLagrangianOptimizer encountered a nonfinite vector");
+  }
+}
+
+void RequireFiniteJacobians(gtsam::OptionalMatrixVecType jacobians) {
+  if (jacobians) {
+    for (const Matrix& jacobian : *jacobians) {
+      if (!jacobian.allFinite()) {
+        throw std::runtime_error(
+            "AugmentedLagrangianOptimizer encountered a nonfinite Jacobian");
+      }
+    }
+  }
+}
+
 /**
  * Preserve exact quadratic-constraint curvature in the LM local model.
  * Gauss--Newton drops residual*Hessian(h), material for affine epigraph
@@ -152,7 +177,12 @@ class BiasedFactor : public NoiseModelFactor {
   Vector unwhitenedError(
       const Values& values,
       gtsam::OptionalMatrixVecType jacobians = nullptr) const override {
-    return originalFactor_->unwhitenedError(values, jacobians) + bias_;
+    Vector error = originalFactor_->unwhitenedError(values, jacobians);
+    RequireFinite(error);
+    RequireFiniteJacobians(jacobians);
+    error += bias_;
+    RequireFinite(error);
+    return error;
   }
 
   GaussianFactor::shared_ptr linearize(const Values& values) const override {
@@ -228,14 +258,22 @@ class PhrInequalityFactor : public NoiseModelFactor {
       // Convert both g and dg/dx to whitened constraint coordinates so sigma
       // provides the same fixed scaling in the merit function and diagnostics.
       expression = constraint_->unwhitenedExpr(values, jacobians);
+      RequireFinite(expression(0));
+      RequireFiniteJacobians(jacobians);
       constraint_->noiseModel()->WhitenSystem(*jacobians, expression);
     } else {
+      expression = constraint_->unwhitenedExpr(values);
+      RequireFinite(expression(0));
       expression = constraint_->whitenedExpr(values);
     }
+
+    RequireFinite(expression(0));
+    RequireFiniteJacobians(jacobians);
 
     // On the inactive branch lambda + rho*g <= 0, max(0, .) and its selected
     // boundary derivative are zero.
     const double shifted = lambda_ + penalty_ * expression(0);
+    RequireFinite(shifted);
     if (shifted <= 0.0) {
       if (jacobians) {
         for (Matrix& jacobian : *jacobians) {
@@ -253,7 +291,10 @@ class PhrInequalityFactor : public NoiseModelFactor {
         jacobian *= sqrtPenalty;
       }
     }
-    return Vector1(shifted / sqrtPenalty);
+    RequireFiniteJacobians(jacobians);
+    const double residual = shifted / sqrtPenalty;
+    RequireFinite(residual);
+    return Vector1(residual);
   }
 
   GaussianFactor::shared_ptr linearize(const Values& values) const override {
@@ -579,12 +620,15 @@ struct Diagnostics {
 
 /* ************************************************************************* */
 double InfinityNorm(const Vector& vector) {
+  RequireFinite(vector);
   return vector.size() == 0 ? 0.0 : vector.cwiseAbs().maxCoeff();
 }
 
 /* ************************************************************************* */
 double AugmentedLagrangianStationarity(const NonlinearFactorGraph& graph,
                                        const Values& values) {
+  // A finite reduced gradient cannot certify a nonfinite merit value.
+  RequireFinite(graph.error(values));
   const VectorValues gradient = graph.linearize(values)->gradientAtZero();
   double infinityNorm = 0.0;
   for (const auto& keyGradient : gradient) {
@@ -598,6 +642,8 @@ Diagnostics EvaluateDiagnostics(const ConstrainedOptProblem& problem,
                                 const Values& values,
                                 const AugmentedLagrangianState& subproblem) {
   Diagnostics diagnostics;
+  RequireFinite(subproblem.muEq);
+  RequireFinite(subproblem.muIneq);
 
   // Equality feasibility contributes ||h(x)||_inf to theta.
   for (const auto& constraint : problem.eConstraints()) {
@@ -610,14 +656,21 @@ Diagnostics EvaluateDiagnostics(const ConstrainedOptProblem& problem,
   for (size_t i = 0; i < inequalities.size(); ++i) {
     const double expression = inequalities.at(i)->whitenedExpr(values)(0);
     const double lambda = subproblem.lambdaIneq.at(i);
+    RequireFinite(expression);
+    RequireFinite(lambda);
 
     // q=max(g,-lambda/rho) makes the projected multiplier update
     // lambda^+=max(0,lambda+rho*g)=lambda+rho*q. Thus q=0 encodes primal
     // feasibility and complementarity, including inactive inequalities.
-    const double projectedResidual =
-        std::max(expression, -lambda / subproblem.muIneq);
-    const double projectedLambda =
-        std::max(0.0, lambda + subproblem.muIneq * expression);
+    const double lowerBound = -lambda / subproblem.muIneq;
+    RequireFinite(lowerBound);
+    const double projectedResidual = std::max(expression, lowerBound);
+    const double shifted = lambda + subproblem.muIneq * expression;
+    RequireFinite(shifted);
+    const double projectedLambda = std::max(0.0, shifted);
+    RequireFinite(projectedResidual);
+    const double complementarity = projectedLambda * expression;
+    RequireFinite(complementarity);
 
     // BCL accepts a multiplier update using
     // theta=max(||h||_inf,||q||_inf), not merely max(g,0).
@@ -628,7 +681,7 @@ Diagnostics EvaluateDiagnostics(const ConstrainedOptProblem& problem,
     diagnostics.primalInequalityViolation = std::max(
         diagnostics.primalInequalityViolation, std::max(0.0, expression));
     diagnostics.complementarity = std::max(
-        diagnostics.complementarity, std::abs(projectedLambda * expression));
+        diagnostics.complementarity, std::abs(complementarity));
   }
 
   return diagnostics;
@@ -694,7 +747,8 @@ AugmentedLagrangianOptimizer::iterate(const State& state, double muEq,
                                       double muIneq) const {
   // Validate the fixed-parameter augmented-Lagrangian subproblem.
   validateConfiguration();
-  if (muEq <= 0.0 || muIneq <= 0.0) {
+  if (!std::isfinite(muEq) || !std::isfinite(muIneq) ||
+      muEq <= 0.0 || muIneq <= 0.0) {
     throw std::invalid_argument("ALM direct penalties must be positive");
   }
   if (p_->updatePolicy == AugmentedLagrangianUpdatePolicy::BCL &&
@@ -775,6 +829,9 @@ AugmentedLagrangianOptimizer::iterate(const State& state, double muEq,
   State solvedState = subproblemState;
   solvedState.iteration = state.iteration + 1;
   solvedState.setValues(optimizer->values(), problem_);
+  RequireFinite(solvedState.cost);
+  RequireFinite(solvedState.eqConstraintViolation);
+  RequireFinite(solvedState.ineqConstraintViolation);
   solvedState.unconstrainedIterations = optimizer->iterations();
   solvedState.totalUnconstrainedIterations =
       state.totalUnconstrainedIterations + solvedState.unconstrainedIterations;
@@ -823,8 +880,9 @@ AugmentedLagrangianOptimizer::iterate(const State& state, double muEq,
         for (size_t i = 0; i < problem_.iConstraints().size(); ++i) {
           const double expression = problem_.iConstraints().at(i)->whitenedExpr(
               solvedState.values)(0);
-          solvedState.lambdaIneq.at(i) =
-              std::max(0.0, solvedState.lambdaIneq.at(i) + muEq * expression);
+          const double shifted = solvedState.lambdaIneq.at(i) + muEq * expression;
+          RequireFinite(shifted);
+          solvedState.lambdaIneq.at(i) = std::max(0.0, shifted);
         }
         solvedState.updateType = AugmentedLagrangianUpdateType::Multiplier;
 
@@ -846,6 +904,15 @@ AugmentedLagrangianOptimizer::iterate(const State& state, double muEq,
     }
   }
 
+  for (const Vector& multiplier : solvedState.lambdaEq) {
+    InfinityNorm(multiplier);
+  }
+  for (double multiplier : solvedState.lambdaIneq) {
+    RequireFinite(multiplier);
+  }
+  RequireFinite(nextMuEq);
+  RequireFinite(nextMuIneq);
+
   solvedState.time =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
           .count();
@@ -859,6 +926,9 @@ Values AugmentedLagrangianOptimizer::optimize() const {
 
   // Construct the initial primal-dual state with zero multipliers.
   State state(0, initialValues_, problem_);
+  RequireFinite(state.cost);
+  RequireFinite(state.eqConstraintViolation);
+  RequireFinite(state.ineqConstraintViolation);
   state.initializeLagrangeMultipliers(problem_);
   if (!p_->initialInequalityMultipliers.empty()) {
     if (p_->initialInequalityMultipliers.size() != state.lambdaIneq.size() ||
@@ -915,7 +985,8 @@ Values AugmentedLagrangianOptimizer::optimize() const {
 NonlinearFactorGraph AugmentedLagrangianOptimizer::augmentedLagrangianFunction(
     const State& state, double /*epsilon*/) const {
   validateConfiguration();
-  if (state.muEq <= 0.0 || state.muIneq <= 0.0) {
+  if (!std::isfinite(state.muEq) || !std::isfinite(state.muIneq) ||
+      state.muEq <= 0.0 || state.muIneq <= 0.0) {
     throw std::invalid_argument("ALM direct penalties must be positive");
   }
   if (state.lambdaEq.size() != problem_.eConstraints().size() ||
@@ -934,8 +1005,10 @@ NonlinearFactorGraph AugmentedLagrangianOptimizer::augmentedLagrangianFunction(
   const auto& equalities = problem_.eConstraints();
   for (size_t i = 0; i < equalities.size(); ++i) {
     const auto& constraint = equalities.at(i);
+    InfinityNorm(state.lambdaEq.at(i));
     Vector bias = state.lambdaEq.at(i) / state.muEq;
     bias = bias.cwiseProduct(constraint->sigmas());
+    InfinityNorm(bias);
     graph.emplace_shared<BiasedFactor>(constraint->penaltyFactor(state.muEq),
                                        bias);
   }
@@ -945,6 +1018,10 @@ NonlinearFactorGraph AugmentedLagrangianOptimizer::augmentedLagrangianFunction(
   // term only by the x-independent constant lambda^2/(2 rho).
   const auto& inequalities = problem_.iConstraints();
   for (size_t i = 0; i < inequalities.size(); ++i) {
+    RequireFinite(state.lambdaIneq.at(i));
+    if (state.lambdaIneq.at(i) < 0.0) {
+      throw std::invalid_argument("ALM inequality multipliers must be nonnegative");
+    }
     graph.emplace_shared<PhrInequalityFactor>(
         inequalities.at(i), state.lambdaIneq.at(i), state.muIneq);
   }
@@ -978,8 +1055,10 @@ void AugmentedLagrangianOptimizer::updateLagrangeMultiplier(
     const double stepSize =
         std::min(p_->maxDualStepSizeIneq,
                  subproblemState.muIneq * p_->dualStepSizeFactorIneq);
-    solvedState->lambdaIneq.at(i) =
-        std::max(0.0, subproblemState.lambdaIneq.at(i) + stepSize * violation);
+    const double shifted =
+        subproblemState.lambdaIneq.at(i) + stepSize * violation;
+    RequireFinite(shifted);
+    solvedState->lambdaIneq.at(i) = std::max(0.0, shifted);
   }
 }
 
