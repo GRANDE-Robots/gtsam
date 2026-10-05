@@ -571,21 +571,39 @@ class StableQcqpLM : public LevenbergMarquardtOptimizer {
         } else {
           proposed = solve(buildDampedSystem(*linear,diagonal),params_);
         }
-        next = state->values.retract(proposed);
-        const VectorValues realized = state->values.localCoordinates(next);
-        if (realized.norm()>0.0 && std::isfinite(realized.norm())) {
-          solved = true;
-          for (const auto& factor : *linear) {
-            if (!factor) continue;
-            const auto local = HessianReduction(HessianFactor(*factor),realized);
-            predicted.add(local.reduction);
-            predicted.arithmeticScale += local.arithmeticScale;
+        // A solved cap direction may overshoot the nonlinear merit. Try
+        // bounded fractions of that same direction from the same base point.
+        // Keep the original full-step prediction gate, merit and tolerances.
+        const double directionalDerivative =
+            triedLambda >= params_.lambdaUpperBound
+                ? linear->gradientAtZero().dot(proposed) : 0.0;
+        const bool capDescent = triedLambda >= params_.lambdaUpperBound &&
+            std::isfinite(directionalDerivative) && directionalDerivative < 0.0;
+        for (size_t contractions = 0; ; ++contractions) {
+          solved = false;
+          predicted = MeritDifference{};
+          actual = MeritDifference{};
+          const VectorValues trial = contractions == 0
+              ? proposed : std::ldexp(1.0, -int(contractions)) * proposed;
+          next = state->values.retract(trial);
+          const VectorValues realized = state->values.localCoordinates(next);
+          const double stepNorm = realized.norm();
+          if (stepNorm > 0.0 && std::isfinite(stepNorm)) {
+            solved = true;
+            for (const auto& factor : *linear) {
+              if (!factor) continue;
+              const auto local = HessianReduction(HessianFactor(*factor),realized);
+              predicted.add(local.reduction);
+              predicted.arithmeticScale += local.arithmeticScale;
+            }
+            if (predicted.positive()) {
+              actual = actualReduction(state->values,next,realized);
+              accepted = actual.positive() &&
+                  actual.reduction/predicted.reduction>params_.minModelFidelity;
+            }
           }
-          if (predicted.positive()) {
-            actual = actualReduction(state->values,next,realized);
-            accepted = actual.positive() &&
-                actual.reduction/predicted.reduction>params_.minModelFidelity;
-          }
+          if (accepted || !capDescent || !solved || contractions == 64 ||
+              (contractions == 0 && !predicted.positive())) break;
         }
       } catch (const IndeterminateSystemException&) {
         solved = false;
