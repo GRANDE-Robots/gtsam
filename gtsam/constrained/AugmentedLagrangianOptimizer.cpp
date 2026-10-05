@@ -624,6 +624,13 @@ class StableQcqpLM : public LevenbergMarquardtOptimizer {
       // attempt to the cap, so the configured boundary is actually tried.
       if (triedLambda>=params_.lambdaUpperBound) return linear;
       state->increaseLambda(params_);
+      // Repeated successful decreases may underflow damping to zero. A
+      // refused undamped step then needs the configured positive seed;
+      // multiplying zero cannot resume the bounded damping search.
+      if (triedLambda == 0.0 && state->lambda == 0.0 &&
+          std::isfinite(params_.lambdaInitial) && params_.lambdaInitial > 0.0) {
+        state->lambda = params_.lambdaInitial;
+      }
       state->lambda = std::min(state->lambda,params_.lambdaUpperBound);
       if (!(state->lambda>triedLambda)) return linear;
     }

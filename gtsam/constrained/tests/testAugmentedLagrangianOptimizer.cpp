@@ -20,11 +20,13 @@
 #include <CppUnitLite/TestHarness.h>
 #include <gtsam/constrained/AugmentedLagrangianOptimizer.h>
 #include <gtsam/constrained/QuadraticConstraint.h>
+#include <gtsam/constrained/QpCost.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/linear/GaussianFactorGraph.h>
 #include <gtsam/nonlinear/expressions.h>
 
 #include <cmath>
+#include <limits>
 
 #include "constrainedExample.h"
 
@@ -517,6 +519,76 @@ TEST(AugmentedLagrangianCapTrial, RetainsAcceptedFullStep) {
 }
 
 }  // namespace cap_trial_tests
+/* ************************************************************************* */
+
+/* ************************************************************************* */
+namespace zero_damping_tests {
+
+const Symbol kX('x', 0);
+
+AugmentedLagrangianState solveQuartic(double initialDamping,
+                                     const std::string& backend) {
+  Vector initial = Vector::Constant(1, .8);
+  Values values;
+  values.insert(kX, initial);
+  NonlinearFactorGraph costs;
+  costs.emplace_shared<QpCost>(HessianFactor(
+      kX, Matrix::Zero(1, 1), Vector::Constant(1, -3.), 0.));
+  NonlinearEqualityConstraints equalities;
+  equalities.push_back(QuadraticConstraint::Equal(
+      kX, Matrix::Identity(1, 1), 1.).createEqualityFactor());
+  const ConstrainedOptProblem problem(costs, equalities, {});
+  auto params = std::make_shared<AugmentedLagrangianParams>();
+  params->lmParams.setLinearSolverType(backend);
+  params->lmParams.lambdaInitial = initialDamping;
+  params->lmParams.lambdaFactor = 1e150;
+  params->lmParams.lambdaUpperBound = 10.;
+  params->lmParams.maxIterations = 50;
+  params->lmParams.relativeErrorTol = params->lmParams.absoluteErrorTol = 0.;
+  params->absoluteStationarityTolerance = 1e-8;
+  AugmentedLagrangianState state(0, values, problem);
+  state.initializeLagrangeMultipliers(problem);
+  state.muEq = state.muIneq = 1.;
+  state.bclOmega = 1e-8;
+  state.bclEta = 1e-6;
+  return std::get<0>(AugmentedLagrangianOptimizer(problem, values, params)
+                         .iterate(state, 1., 1.));
+}
+
+// Verifies underflowed damping recovers after the next undamped Hessian fails.
+TEST(AugmentedLagrangianZeroDamping, RecoversAfterSuccessfulStepUnderflows) {
+  const double initialDamping = std::numeric_limits<double>::min();
+  CHECK(initialDamping / 1e150 == 0.);
+  // For 3*x + .5*(x*x-1)^2, the first undamped Newton step decreases
+  // merit from x=.8 but reaches a point with negative second derivative.
+  const double first = .8 - (3. + 2. * .8 * (.8 * .8 - 1.)) /
+                               (6. * .8 * .8 - 2.);
+  CHECK(6. * first * first - 2. < 0.);
+  for (const auto& backend : {"MULTIFRONTAL_CHOLESKY", "SEQUENTIAL_CHOLESKY"}) {
+    const auto result = solveQuartic(initialDamping, backend);
+    const double value = result.values.at<Vector>(kX)(0);
+    CHECK(result.innerConverged);
+    CHECK(result.unconstrainedIterations > 1);
+    CHECK(result.unconstrainedIterations <= 50);
+    CHECK(std::abs(3. + 2. * value * (value * value - 1.)) <= 1e-8);
+    CHECK(result.augmentedLagrangianStationarity <= 1e-8);
+    CHECK(!result.converged);
+    EXPECT_DOUBLES_EQUAL(0., result.lambdaEq.at(0)(0), 0.);
+  }
+}
+
+// Verifies refusal remains safe when no positive damping seed was configured.
+TEST(AugmentedLagrangianZeroDamping, RefusesWithoutDeclaredPositiveSeed) {
+  for (const auto& backend : {"MULTIFRONTAL_CHOLESKY", "SEQUENTIAL_CHOLESKY"}) {
+    const auto result = solveQuartic(0., backend);
+    CHECK(!result.innerConverged);
+    EXPECT(result.unconstrainedIterations == 1);
+    CHECK(!result.converged);
+    EXPECT_DOUBLES_EQUAL(0., result.lambdaEq.at(0)(0), 0.);
+  }
+}
+
+}  // namespace zero_damping_tests
 /* ************************************************************************* */
 
 /* ************************************************************************* */
