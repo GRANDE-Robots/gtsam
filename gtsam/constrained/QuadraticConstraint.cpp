@@ -20,6 +20,7 @@
 #include <gtsam/nonlinear/Values.h>
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <vector>
 
@@ -72,7 +73,6 @@ Vector ConstraintError(const QuadraticConstraint& constraint,
     X.middleRows(offset, block.rows()) = block;
     offset += block.rows();
   }
-  const Matrix AX = constraint.A() * X;
   const double sign = SenseSign(constraint.sense());
   if (H) {
     H->resize(blocks.size());
@@ -88,7 +88,24 @@ Vector ConstraintError(const QuadraticConstraint& constraint,
       offset += blocks[index].rows();
     }
   }
-  return Vector1(sign * ((X.transpose() * AX).trace() - constraint.b()));
+  // Evaluate the same polynomial before rounding to the factor's scalar type.
+  // Double matrix products can discard a residual through cancellation.
+  long double residual = -static_cast<long double>(constraint.b());
+  long double compensation = 0.0L;
+  for (DenseIndex column = 0; column < X.cols(); ++column) {
+    for (DenseIndex row = 0; row < X.rows(); ++row) {
+      for (DenseIndex other = 0; other < X.rows(); ++other) {
+        const long double term = static_cast<long double>(X(row, column)) *
+                                 constraint.A()(row, other) * X(other, column);
+        const long double next = residual + term;
+        compensation += std::abs(residual) >= std::abs(term)
+                            ? (residual - next) + term
+                            : (term - next) + residual;
+        residual = next;
+      }
+    }
+  }
+  return Vector1(sign * static_cast<double>(residual + compensation));
 }
 
 }  // namespace
