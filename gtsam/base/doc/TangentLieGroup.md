@@ -119,5 +119,4 @@ always the base tangent followed by the transported algebra component.
 Use a tangent group when a state contains a Lie-group element together with an
 algebra-valued quantity that transforms through the group's adjoint action. See
 [`SemidirectLieGroup`](SemidirectLieGroup.md) for general action-coupled
-products. The implementation and its analytic Jacobians are exercised by
-[`testTangentLieGroup.cpp`](../../../tests/testTangentLieGroup.cpp).
+products.
