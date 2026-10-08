@@ -58,3 +58,6 @@ Use [`SemidirectLieGroup`](SemidirectLieGroup.md) when the first group acts on
 the second component during composition. Use
 [`TangentLieGroup`](TangentLieGroup.md) for the important adjoint-action
 construction `G ⋉ 𝔤`, which has additional structured kernels.
+
+The implementation is exercised by
+[`testProductLieGroup.cpp`](../../../tests/testProductLieGroup.cpp).

@@ -72,3 +72,6 @@ adjoint.
 For the special adjoint action of a group on its own algebra, prefer
 [`TangentLieGroup`](TangentLieGroup.md), whose repeated-block structure admits
 faster kernels and simpler direct formulas.
+
+The implementation is exercised by
+[`testSemidirectLieGroup.cpp`](../../../tests/testSemidirectLieGroup.cpp).
