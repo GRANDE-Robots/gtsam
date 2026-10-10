@@ -19,11 +19,14 @@
 
 #include <CppUnitLite/TestHarness.h>
 #include <gtsam/constrained/AugmentedLagrangianOptimizer.h>
+#include <gtsam/constrained/QuadraticConstraint.h>
+#include <gtsam/constrained/QpCost.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/linear/GaussianFactorGraph.h>
 #include <gtsam/nonlinear/expressions.h>
 
 #include <cmath>
+#include <limits>
 
 #include "constrainedExample.h"
 
@@ -432,6 +435,160 @@ TEST(AugmentedLagrangianBCL, MixedChangingActiveSetOptimization) {
 }
 
 }  // namespace optimization_tests
+/* ************************************************************************* */
+
+/* ************************************************************************* */
+namespace cap_trial_tests {
+
+const Key kVector = 0;
+
+AugmentedLagrangianState OneStep(
+    double initial, double penalty, const std::string& backend,
+    double minimumFidelity = 1e-3) {
+  Vector value(1);
+  value(0) = initial;
+  Values values;
+  values.insert(kVector, value);
+  NonlinearEqualityConstraints equalities;
+  equalities.push_back(QuadraticConstraint::Equal(
+      kVector, Matrix::Identity(1, 1), 1.0).createEqualityFactor());
+  const ConstrainedOptProblem problem({}, equalities, {});
+  auto params = std::make_shared<AugmentedLagrangianParams>();
+  params->lmParams.setLinearSolverType(backend);
+  params->lmParams.lambdaInitial = params->lmParams.lambdaUpperBound = 1e5;
+  params->lmParams.minModelFidelity = minimumFidelity;
+  params->lmParams.maxIterations = 1;
+  params->lmParams.relativeErrorTol = params->lmParams.absoluteErrorTol = 0.0;
+  AugmentedLagrangianState state(0, values, problem);
+  state.initializeLagrangeMultipliers(problem);
+  state.muEq = state.muIneq = penalty;
+  state.bclOmega = 1e-5;
+  state.bclEta = 1e-6;
+  return std::get<0>(AugmentedLagrangianOptimizer(problem, values, params)
+                         .iterate(state, penalty, penalty));
+}
+
+// Verifies a merit-increasing solved cap step admits its exact 1/16 fraction.
+TEST(AugmentedLagrangianCapTrial, ContractsSolvedOvershoot) {
+  const double initial = .01, penalty = 49990.0;
+  const double gradient = 2.0 * penalty * initial * (initial * initial - 1.0);
+  const double hessian = penalty * (6.0 * initial * initial - 2.0);
+  const double fullStep = -gradient / (hessian + 1e5);
+  const auto merit = [penalty](double x) {
+    return .5 * penalty * std::pow(x * x - 1.0, 2);
+  };
+  CHECK(merit(initial + fullStep) > merit(initial));
+  for (const auto& backend : {"MULTIFRONTAL_CHOLESKY", "SEQUENTIAL_CHOLESKY"}) {
+    const auto result = OneStep(initial, penalty, backend);
+    const double value = result.values.at<Vector>(kVector)(0);
+    EXPECT(result.unconstrainedIterations == 1);
+    EXPECT_DOUBLES_EQUAL(initial + fullStep / 16.0, value, 1e-12);
+    CHECK(merit(value) < merit(initial));
+    CHECK(!result.converged);
+    EXPECT_DOUBLES_EQUAL(0.0, result.lambdaEq.at(0)(0), 0.0);
+  }
+}
+
+// Verifies an unsolved indefinite cap retains its original point and counters.
+TEST(AugmentedLagrangianCapTrial, RefusesIndefiniteCap) {
+  const auto result = OneStep(.01, 1e9, "MULTIFRONTAL_CHOLESKY");
+  EXPECT(result.unconstrainedIterations == 0);
+  EXPECT_DOUBLES_EQUAL(.01, result.values.at<Vector>(kVector)(0), 0.0);
+  CHECK(!result.converged);
+  EXPECT_DOUBLES_EQUAL(0.0, result.lambdaEq.at(0)(0), 0.0);
+}
+
+// Verifies exhausted fidelity trials do not adopt a point or update multipliers.
+TEST(AugmentedLagrangianCapTrial, ExhaustionDoesNotAdopt) {
+  const auto result = OneStep(.01, 49990.0, "MULTIFRONTAL_CHOLESKY", 1e10);
+  EXPECT(result.unconstrainedIterations == 0);
+  EXPECT_DOUBLES_EQUAL(.01, result.values.at<Vector>(kVector)(0), 0.0);
+  EXPECT_DOUBLES_EQUAL(0.0, result.lambdaEq.at(0)(0), 0.0);
+  CHECK(!result.converged);
+}
+
+// Verifies an accepted ordinary cap step retains its full solved displacement.
+TEST(AugmentedLagrangianCapTrial, RetainsAcceptedFullStep) {
+  const double initial = 1.02, penalty = 10.0;
+  const double gradient = 2.0 * penalty * initial * (initial * initial - 1.0);
+  const double hessian = penalty * (6.0 * initial * initial - 2.0);
+  const auto result = OneStep(initial, penalty, "MULTIFRONTAL_CHOLESKY");
+  EXPECT(result.unconstrainedIterations == 1);
+  EXPECT_DOUBLES_EQUAL(initial - gradient / (hessian + 1e5),
+                      result.values.at<Vector>(kVector)(0), 1e-15);
+}
+
+}  // namespace cap_trial_tests
+/* ************************************************************************* */
+
+/* ************************************************************************* */
+namespace zero_damping_tests {
+
+const Symbol kX('x', 0);
+
+AugmentedLagrangianState solveQuartic(double initialDamping,
+                                     const std::string& backend) {
+  Vector initial = Vector::Constant(1, .8);
+  Values values;
+  values.insert(kX, initial);
+  NonlinearFactorGraph costs;
+  costs.emplace_shared<QpCost>(HessianFactor(
+      kX, Matrix::Zero(1, 1), Vector::Constant(1, -3.), 0.));
+  NonlinearEqualityConstraints equalities;
+  equalities.push_back(QuadraticConstraint::Equal(
+      kX, Matrix::Identity(1, 1), 1.).createEqualityFactor());
+  const ConstrainedOptProblem problem(costs, equalities, {});
+  auto params = std::make_shared<AugmentedLagrangianParams>();
+  params->lmParams.setLinearSolverType(backend);
+  params->lmParams.lambdaInitial = initialDamping;
+  params->lmParams.lambdaFactor = 1e150;
+  params->lmParams.lambdaUpperBound = 10.;
+  params->lmParams.maxIterations = 50;
+  params->lmParams.relativeErrorTol = params->lmParams.absoluteErrorTol = 0.;
+  params->absoluteStationarityTolerance = 1e-8;
+  AugmentedLagrangianState state(0, values, problem);
+  state.initializeLagrangeMultipliers(problem);
+  state.muEq = state.muIneq = 1.;
+  state.bclOmega = 1e-8;
+  state.bclEta = 1e-6;
+  return std::get<0>(AugmentedLagrangianOptimizer(problem, values, params)
+                         .iterate(state, 1., 1.));
+}
+
+// Verifies underflowed damping recovers after the next undamped Hessian fails.
+TEST(AugmentedLagrangianZeroDamping, RecoversAfterSuccessfulStepUnderflows) {
+  const double initialDamping = std::numeric_limits<double>::min();
+  CHECK(initialDamping / 1e150 == 0.);
+  // For 3*x + .5*(x*x-1)^2, the first undamped Newton step decreases
+  // merit from x=.8 but reaches a point with negative second derivative.
+  const double first = .8 - (3. + 2. * .8 * (.8 * .8 - 1.)) /
+                               (6. * .8 * .8 - 2.);
+  CHECK(6. * first * first - 2. < 0.);
+  for (const auto& backend : {"MULTIFRONTAL_CHOLESKY", "SEQUENTIAL_CHOLESKY"}) {
+    const auto result = solveQuartic(initialDamping, backend);
+    const double value = result.values.at<Vector>(kX)(0);
+    CHECK(result.innerConverged);
+    CHECK(result.unconstrainedIterations > 1);
+    CHECK(result.unconstrainedIterations <= 50);
+    CHECK(std::abs(3. + 2. * value * (value * value - 1.)) <= 1e-8);
+    CHECK(result.augmentedLagrangianStationarity <= 1e-8);
+    CHECK(!result.converged);
+    EXPECT_DOUBLES_EQUAL(0., result.lambdaEq.at(0)(0), 0.);
+  }
+}
+
+// Verifies refusal remains safe when no positive damping seed was configured.
+TEST(AugmentedLagrangianZeroDamping, RefusesWithoutDeclaredPositiveSeed) {
+  for (const auto& backend : {"MULTIFRONTAL_CHOLESKY", "SEQUENTIAL_CHOLESKY"}) {
+    const auto result = solveQuartic(0., backend);
+    CHECK(!result.innerConverged);
+    EXPECT(result.unconstrainedIterations == 1);
+    CHECK(!result.converged);
+    EXPECT_DOUBLES_EQUAL(0., result.lambdaEq.at(0)(0), 0.);
+  }
+}
+
+}  // namespace zero_damping_tests
 /* ************************************************************************* */
 
 /* ************************************************************************* */

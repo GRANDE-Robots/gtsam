@@ -18,19 +18,19 @@
 #include <gtsam/constrained/QcqpProblem.h>
 
 #include <algorithm>
-#include <unordered_map>
+#include <map>
 #include <vector>
 
 namespace gtsam {
 namespace {
 
 using QuadraticConstraintIndex =
-    std::unordered_map<Key, std::vector<QuadraticConstraint>>;
+    std::map<KeyVector, std::vector<QuadraticConstraint>>;
 
 /* ************************************************************************* */
 bool SameQuadraticEquality(const QuadraticConstraint& first,
                            const QuadraticConstraint& second) {
-  return first.key() == second.key() && first.A().isApprox(second.A(), 0.0) &&
+  return first.keys() == second.keys() && first.A().isApprox(second.A(), 0.0) &&
          first.b() == second.b() && first.sigma() == second.sigma();
 }
 
@@ -48,7 +48,7 @@ void MergeEqualityConstraints(
     }
 
     const QuadraticConstraint& constraint = quadratic->quadraticConstraint();
-    auto& sameKeyConstraints = (*quadraticConstraintIndex)[constraint.key()];
+    auto& sameKeyConstraints = (*quadraticConstraintIndex)[constraint.keys()];
     const bool alreadyPresent =
         std::any_of(sameKeyConstraints.begin(), sameKeyConstraints.end(),
                     [&constraint](const QuadraticConstraint& existing) {

@@ -19,7 +19,10 @@
 #include <gtsam/constrained/QuadraticConstraint.h>
 #include <gtsam/nonlinear/Values.h>
 
+#include <algorithm>
+#include <cmath>
 #include <stdexcept>
+#include <vector>
 
 namespace gtsam {
 namespace {
@@ -48,29 +51,77 @@ Matrix VectorOrMatrixAsMatrix(const Values& values, Key key) {
 /* ************************************************************************* */
 Vector ConstraintError(const QuadraticConstraint& constraint,
                        const Values& values, OptionalMatrixVecType H) {
-  const Matrix X = VectorOrMatrixAsMatrix(values, constraint.key());
-  if (X.rows() != constraint.A().rows()) {
-    throw std::invalid_argument(
-        "QuadraticConstraint: value dimension does not match A.");
+  std::vector<Matrix> blocks;
+  DenseIndex totalRows = 0;
+  DenseIndex columns = 0;
+  for (Key key : constraint.keys()) {
+    Matrix block = VectorOrMatrixAsMatrix(values, key);
+    if (columns && block.cols() != columns) {
+      throw std::invalid_argument("QuadraticConstraint: column counts differ.");
+    }
+    columns = block.cols();
+    totalRows += block.rows();
+    blocks.push_back(std::move(block));
   }
-
-  const Matrix AX = constraint.A() * X;
+  if (totalRows != constraint.A().rows()) {
+    throw std::invalid_argument(
+        "QuadraticConstraint: stacked value dimension does not match A.");
+  }
+  Matrix X(totalRows, columns);
+  DenseIndex offset = 0;
+  for (const Matrix& block : blocks) {
+    X.middleRows(offset, block.rows()) = block;
+    offset += block.rows();
+  }
   const double sign = SenseSign(constraint.sense());
   if (H) {
+    H->resize(blocks.size());
     const Matrix gradient =
         sign * (constraint.A() + constraint.A().transpose()) * X;
-    const Eigen::Map<const Vector> vectorized(gradient.data(), gradient.size());
-    (*H)[0] = vectorized.transpose();
+    offset = 0;
+    for (size_t index = 0; index < blocks.size(); ++index) {
+      const Matrix blockGradient =
+          gradient.middleRows(offset, blocks[index].rows());
+      const Eigen::Map<const Vector> vectorized(blockGradient.data(),
+                                                blockGradient.size());
+      (*H)[index] = vectorized.transpose();
+      offset += blocks[index].rows();
+    }
   }
-  return Vector1(sign * ((X.transpose() * AX).trace() - constraint.b()));
+  // Evaluate the same polynomial before rounding to the factor's scalar type.
+  // Double matrix products can discard a residual through cancellation.
+  long double residual = -static_cast<long double>(constraint.b());
+  long double compensation = 0.0L;
+  for (DenseIndex column = 0; column < X.cols(); ++column) {
+    for (DenseIndex row = 0; row < X.rows(); ++row) {
+      for (DenseIndex other = 0; other < X.rows(); ++other) {
+        const long double term = static_cast<long double>(X(row, column)) *
+                                 constraint.A()(row, other) * X(other, column);
+        const long double next = residual + term;
+        compensation += std::abs(residual) >= std::abs(term)
+                            ? (residual - next) + term
+                            : (term - next) + residual;
+        residual = next;
+      }
+    }
+  }
+  return Vector1(sign * static_cast<double>(residual + compensation));
 }
 
 }  // namespace
 
 /* ************************************************************************* */
-QuadraticConstraint::QuadraticConstraint(Key key, const Matrix& A, double b,
-                                         Sense sense, double sigma)
-    : key_(key), A_(A), b_(b), sense_(sense), sigma_(sigma) {
+QuadraticConstraint::QuadraticConstraint(const KeyVector& keys, const Matrix& A,
+                                         double b, Sense sense, double sigma)
+    : keys_(keys), A_(A), b_(b), sense_(sense), sigma_(sigma) {
+  if (keys_.empty()) {
+    throw std::invalid_argument("QuadraticConstraint: keys must not be empty.");
+  }
+  KeyVector sorted = keys_;
+  std::sort(sorted.begin(), sorted.end());
+  if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+    throw std::invalid_argument("QuadraticConstraint: keys must be unique.");
+  }
   if (A_.rows() != A_.cols()) {
     throw std::invalid_argument("QuadraticConstraint: A must be square.");
   }

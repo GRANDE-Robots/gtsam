@@ -18,7 +18,16 @@
  */
 
 #include <gtsam/constrained/AugmentedLagrangianOptimizer.h>
+#include <gtsam/constrained/QuadraticConstraint.h>
+#include <gtsam/base/GenericValue.h>
+#include <gtsam/linear/HessianFactor.h>
 #include <gtsam/linear/GaussianFactorGraph.h>
+#include <gtsam/constrained/QpCost.h>
+#include <typeinfo>
+#include <gtsam/nonlinear/NonlinearMultifrontalSolver.h>
+#include <gtsam/constrained/LinearConstraint.h>
+#include <gtsam/nonlinear/internal/LevenbergMarquardtState.h>
+#include <gtsam/linear/linearExceptions.h>
 
 #include <algorithm>
 #include <chrono>
@@ -30,6 +39,94 @@ using std::cout, std::endl, std::setprecision, std::setw;
 
 namespace gtsam {
 namespace {
+
+void RequireFinite(double value) {
+  if (!std::isfinite(value)) {
+    throw std::runtime_error(
+        "AugmentedLagrangianOptimizer encountered a nonfinite evaluation");
+  }
+}
+
+void RequireFinite(const Vector& vector) {
+  if (!vector.allFinite()) {
+    throw std::runtime_error(
+        "AugmentedLagrangianOptimizer encountered a nonfinite vector");
+  }
+}
+
+void RequireFiniteJacobians(gtsam::OptionalMatrixVecType jacobians) {
+  if (jacobians) {
+    for (const Matrix& jacobian : *jacobians) {
+      if (!jacobian.allFinite()) {
+        throw std::runtime_error(
+            "AugmentedLagrangianOptimizer encountered a nonfinite Jacobian");
+      }
+    }
+  }
+}
+
+/**
+ * Preserve exact quadratic-constraint curvature in the LM local model.
+ * Gauss--Newton drops residual*Hessian(h), material for affine epigraph
+ * objectives. Error and gradient stay unchanged; LM damps and accepts its
+ * step against the actual nonlinear merit function.
+ */
+GaussianFactor::shared_ptr AddQuadraticCurvature(
+    const GaussianFactor::shared_ptr& gaussian,
+    const QuadraticConstraint& constraint, const Values& values,
+    double coefficient) {
+  HessianFactor base(*gaussian);
+  Matrix augmented = base.augmentedInformation();
+  std::vector<DenseIndex> rows, columns, dimensions;
+  for (Key key : constraint.keys()) {
+    const Value& value = values.at(key);
+    if (const auto* vector = dynamic_cast<const GenericValue<Vector>*>(&value)) {
+      rows.push_back(vector->value().size());
+      columns.push_back(1);
+    } else if (const auto* matrix =
+                   dynamic_cast<const GenericValue<Matrix>*>(&value)) {
+      rows.push_back(matrix->value().rows());
+      columns.push_back(matrix->value().cols());
+    } else {
+      throw std::invalid_argument("quadratic curvature needs vector/matrix values");
+    }
+    dimensions.push_back(rows.back() * columns.back());
+  }
+  DenseIndex rowOffset = 0, valueRowOffset = 0;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    DenseIndex colOffset = 0, valueColOffset = 0;
+    for (size_t j = 0; j < rows.size(); ++j) {
+      if (columns[i] != columns[j])
+        throw std::invalid_argument("quadratic curvature column counts differ");
+      const Matrix block =
+          constraint.A().block(rowOffset, colOffset, rows[i], rows[j]) +
+          constraint.A().block(colOffset, rowOffset, rows[j], rows[i]).transpose();
+      for (DenseIndex column = 0; column < columns[i]; ++column)
+        augmented.block(valueRowOffset + column * rows[i],
+                        valueColOffset + column * rows[j], rows[i], rows[j]) +=
+            coefficient * block;
+      colOffset += rows[j];
+      valueColOffset += dimensions[j];
+    }
+    rowOffset += rows[i];
+    valueRowOffset += dimensions[i];
+  }
+  std::vector<Matrix> blocks;
+  std::vector<Vector> linear;
+  DenseIndex offset = 0;
+  for (size_t i = 0; i < dimensions.size(); ++i) {
+    DenseIndex second = offset;
+    for (size_t j = i; j < dimensions.size(); ++j) {
+      blocks.push_back(augmented.block(
+          offset, second, dimensions[i], dimensions[j]));
+      second += dimensions[j];
+    }
+    linear.push_back(augmented.block(offset, valueRowOffset, dimensions[i], 1));
+    offset += dimensions[i];
+  }
+  return std::make_shared<HessianFactor>(
+      constraint.keys(), blocks, linear, augmented(valueRowOffset, valueRowOffset));
+}
 
 /**
  * A factor that adds a constant bias term to an original factor's unwhitened
@@ -80,7 +177,23 @@ class BiasedFactor : public NoiseModelFactor {
   Vector unwhitenedError(
       const Values& values,
       gtsam::OptionalMatrixVecType jacobians = nullptr) const override {
-    return originalFactor_->unwhitenedError(values, jacobians) + bias_;
+    Vector error = originalFactor_->unwhitenedError(values, jacobians);
+    RequireFinite(error);
+    RequireFiniteJacobians(jacobians);
+    error += bias_;
+    RequireFinite(error);
+    return error;
+  }
+
+  GaussianFactor::shared_ptr linearize(const Values& values) const override {
+    auto gaussian = Base::linearize(values);
+    const auto* quadratic =
+        dynamic_cast<const QuadraticEqualityConstraintFactor*>(originalFactor_.get());
+    if (!quadratic) return gaussian;
+    const double sigma = noiseModel()->sigmas()(0);
+    const double coefficient = unwhitenedError(values)(0) / (sigma * sigma);
+    return AddQuadraticCurvature(
+        gaussian, quadratic->quadraticConstraint(), values, coefficient);
   }
 
   /// Print the biased factor.
@@ -145,14 +258,22 @@ class PhrInequalityFactor : public NoiseModelFactor {
       // Convert both g and dg/dx to whitened constraint coordinates so sigma
       // provides the same fixed scaling in the merit function and diagnostics.
       expression = constraint_->unwhitenedExpr(values, jacobians);
+      RequireFinite(expression(0));
+      RequireFiniteJacobians(jacobians);
       constraint_->noiseModel()->WhitenSystem(*jacobians, expression);
     } else {
+      expression = constraint_->unwhitenedExpr(values);
+      RequireFinite(expression(0));
       expression = constraint_->whitenedExpr(values);
     }
+
+    RequireFinite(expression(0));
+    RequireFiniteJacobians(jacobians);
 
     // On the inactive branch lambda + rho*g <= 0, max(0, .) and its selected
     // boundary derivative are zero.
     const double shifted = lambda_ + penalty_ * expression(0);
+    RequireFinite(shifted);
     if (shifted <= 0.0) {
       if (jacobians) {
         for (Matrix& jacobian : *jacobians) {
@@ -170,13 +291,349 @@ class PhrInequalityFactor : public NoiseModelFactor {
         jacobian *= sqrtPenalty;
       }
     }
-    return Vector1(shifted / sqrtPenalty);
+    RequireFiniteJacobians(jacobians);
+    const double residual = shifted / sqrtPenalty;
+    RequireFinite(residual);
+    return Vector1(residual);
+  }
+
+  GaussianFactor::shared_ptr linearize(const Values& values) const override {
+    auto gaussian = Base::linearize(values);
+    const auto* quadratic =
+        dynamic_cast<const QuadraticInequalityConstraintFactor*>(constraint_.get());
+    if (!quadratic) return gaussian;
+    const double shifted =
+        lambda_ + penalty_ * constraint_->whitenedExpr(values)(0);
+    if (shifted <= 0.0) return gaussian;
+    const auto& specification = quadratic->quadraticConstraint();
+    const double sign =
+        specification.sense() == QuadraticConstraint::Sense::GreaterEqual ? -1.0 : 1.0;
+    return AddQuadraticCurvature(
+        gaussian, specification, values,
+        shifted * sign / specification.sigma());
   }
 
   /// Return a deep copy.
   NonlinearFactor::shared_ptr clone() const override {
     return std::static_pointer_cast<NonlinearFactor>(
         NonlinearFactor::shared_ptr(new This(*this)));
+  }
+};
+
+// Exact direct-vector QCQP merit differences; generic manifold/noise factors
+// retain the original optimizer. No feasibility or stationarity rule changes.
+struct MeritDifference {
+  long double reduction = 0.0L;
+  long double arithmeticScale = 0.0L;
+  long double correction = 0.0L;
+  long double inheritedError = 0.0L;
+  void add(long double term) {
+    const long double y = term - correction;
+    const long double next = reduction + y;
+    correction = (next - reduction) - y;
+    reduction = next;
+    arithmeticScale += std::abs(term);
+  }
+  bool positive() const {
+    return std::isfinite(reduction) && reduction >
+        inheritedError + 64.0L * std::numeric_limits<long double>::epsilon() * arithmeticScale;
+  }
+};
+
+struct ExpressionIncrement {
+  long double value, increment, valueError, incrementError;
+};
+ExpressionIncrement ScaledIncrement(const MeritDifference& value,
+                                   const MeritDifference& increment,
+                                   long double scale) {
+  const long double epsilon=64.L*std::numeric_limits<long double>::epsilon();
+  return {scale*value.reduction,scale*increment.reduction,
+          std::abs(scale)*epsilon*(value.arithmeticScale+std::abs(value.reduction)),
+          std::abs(scale)*epsilon*(increment.arithmeticScale+std::abs(increment.reduction))};
+}
+long double MeritIncrementError(const ExpressionIncrement& e,
+                               long double multiplier,long double rho) {
+  return rho*std::abs(e.increment)*e.valueError +
+      (std::abs(multiplier)+rho*(std::abs(e.value)+e.valueError+
+       std::abs(e.increment)+e.incrementError))*e.incrementError;
+}
+
+Matrix DirectMatrix(const Values& values, Key key) {
+  const auto& value = values.at(key);
+  if (const auto* v = dynamic_cast<const GenericValue<Vector>*>(&value))
+    return v->value();
+  if (const auto* m = dynamic_cast<const GenericValue<Matrix>*>(&value))
+    return m->value();
+  throw std::invalid_argument("stable QCQP merit requires direct vector/matrix values");
+}
+
+ExpressionIncrement QuadraticIncrement(
+    const QuadraticConstraint& constraint, const Values& oldValues,
+    const Values& newValues) {
+  DenseIndex rows = 0, cols = 0;
+  for (Key key : constraint.keys()) {
+    const Matrix value = DirectMatrix(oldValues, key);
+    rows += value.rows();
+    if (cols && cols != value.cols())
+      throw std::invalid_argument("stable QCQP column mismatch");
+    cols = value.cols();
+  }
+  using Extended = Eigen::Matrix<long double, Eigen::Dynamic, Eigen::Dynamic>;
+  Extended x(rows, cols), d(rows, cols);
+  DenseIndex offset = 0;
+  for (Key key : constraint.keys()) {
+    const Matrix before = DirectMatrix(oldValues, key);
+    const Matrix after = DirectMatrix(newValues, key);
+    if (before.rows()!=after.rows() || before.cols()!=after.cols())
+      throw std::invalid_argument("stable QCQP value shape changed");
+    x.middleRows(offset, before.rows()) = before.cast<long double>();
+    d.middleRows(offset, before.rows()) =
+        after.cast<long double>() - before.cast<long double>();
+    offset += before.rows();
+  }
+  const Matrix& a = constraint.A();
+  MeritDifference value, increment;
+  value.add(-static_cast<long double>(constraint.b()));
+  for (DenseIndex col=0; col<cols; ++col)
+    for (DenseIndex i=0; i<rows; ++i)
+      for (DenseIndex j=0; j<rows; ++j) {
+        value.add(x(i,col)*a(i,j)*x(j,col));
+        increment.add(d(i,col)*a(i,j)*x(j,col));
+        increment.add(x(i,col)*a(i,j)*d(j,col));
+        increment.add(d(i,col)*a(i,j)*d(j,col));
+      }
+  const long double scale =
+      (constraint.sense()==QuadraticConstraint::Sense::GreaterEqual ? -1.L : 1.L)
+      / constraint.sigma();
+  return ScaledIncrement(value,increment,scale);
+}
+
+MeritDifference HessianReduction(const HessianFactor& hessian,
+                                 const VectorValues& delta) {
+  MeritDifference result;
+  if (hessian.empty()) return result;
+  const Vector d = delta.vector(hessian.keys());
+  const Matrix augmented = hessian.augmentedInformation();
+  const DenseIndex n = d.size();
+  for (DenseIndex i=0; i<n; ++i) {
+    result.add(static_cast<long double>(augmented(i,n))*d(i));
+    for (DenseIndex j=0; j<n; ++j)
+      result.add(-0.5L*static_cast<long double>(d(i))*augmented(i,j)*d(j));
+  }
+  return result;
+}
+
+std::vector<ExpressionIncrement> LinearIncrement(
+    const LinearConstraint& constraint, const Values& before,
+    const Values& after) {
+  const auto& factor = constraint.factor();
+  const Matrix augmented = factor.augmentedJacobianUnweighted();
+  const Vector b = factor.getb();
+  std::vector<long double> x,d;
+  for (Key key : factor.keys()) {
+    const Matrix old = DirectMatrix(before,key), next = DirectMatrix(after,key);
+    for (DenseIndex col=0; col<old.cols(); ++col)
+      for (DenseIndex row=0; row<old.rows(); ++row) {
+        x.push_back(old(row,col));
+        d.push_back(static_cast<long double>(next(row,col))-old(row,col));
+      }
+  }
+  std::vector<ExpressionIncrement> result;
+  for (DenseIndex row=0; row<b.size(); ++row) {
+    MeritDifference value,increment;
+    value.add(-static_cast<long double>(b(row)));
+    for (size_t col=0; col<x.size(); ++col) {
+      value.add(static_cast<long double>(augmented(row,col))*x[col]);
+      increment.add(static_cast<long double>(augmented(row,col))*d[col]);
+    }
+    const long double sign = constraint.sense()==LinearConstraint::Sense::GreaterEqual ? -1.L : 1.L;
+    const long double scale = sign/constraint.sigmas()(row);
+    result.push_back(ScaledIncrement(value,increment,scale));
+  }
+  return result;
+}
+
+MeritDifference CostReduction(const QpCost& cost, const Values& before,
+                              const Values& after) {
+  const auto& factor=cost.hessianFactor();
+  const Matrix augmented=factor.augmentedInformation();
+  std::vector<long double> x,d;
+  for (Key key : factor.keys()) {
+    const Matrix old=DirectMatrix(before,key),next=DirectMatrix(after,key);
+    for (DenseIndex col=0; col<old.cols(); ++col)
+      for (DenseIndex row=0; row<old.rows(); ++row) {
+        x.push_back(old(row,col));
+        d.push_back(static_cast<long double>(next(row,col))-old(row,col));
+      }
+  }
+  MeritDifference result;
+  for (size_t i=0; i<d.size(); ++i) {
+    result.add(static_cast<long double>(augmented(i,d.size()))*d[i]);
+    for (size_t j=0; j<d.size(); ++j) {
+      result.add(-x[i]*augmented(i,j)*d[j]);
+      result.add(-0.5L*d[i]*augmented(i,j)*d[j]);
+    }
+  }
+  return result;
+}
+
+bool ExactQcqpMerit(const ConstrainedOptProblem& problem) {
+  for (const auto& cost : problem.costs())
+    if (cost && typeid(*cost)!=typeid(QpCost)) return false;
+  for (const auto& c : problem.eConstraints())
+    if (typeid(*c)!=typeid(QuadraticEqualityConstraintFactor) &&
+        typeid(*c)!=typeid(LinearEqualityConstraintFactor)) return false;
+  for (const auto& c : problem.iConstraints())
+    if (typeid(*c)!=typeid(QuadraticInequalityConstraintFactor) &&
+        typeid(*c)!=typeid(LinearInequalityConstraintFactor)) return false;
+  return true;
+}
+
+class StableQcqpLM : public LevenbergMarquardtOptimizer {
+  const ConstrainedOptProblem& problem_;
+  AugmentedLagrangianState subproblem_;
+
+  MeritDifference actualReduction(const Values& before, const Values& after,
+                                  const VectorValues& realized) const {
+    MeritDifference result;
+    for (const auto& cost : problem_.costs()) {
+      if (!cost) continue;
+      const MeritDifference local = CostReduction(*dynamic_cast<const QpCost*>(cost.get()),before,after);
+      result.add(local.reduction);
+      result.arithmeticScale += local.arithmeticScale;
+    }
+    for (size_t i=0; i<problem_.eConstraints().size(); ++i) {
+      const auto* quadratic = dynamic_cast<const QuadraticEqualityConstraintFactor*>(problem_.eConstraints()[i].get());
+      std::vector<ExpressionIncrement> components;
+      if (quadratic) components.push_back(QuadraticIncrement(quadratic->quadraticConstraint(),before,after));
+      else components=LinearIncrement(dynamic_cast<const LinearEqualityConstraintFactor*>(problem_.eConstraints()[i].get())->linearConstraint(),before,after);
+      const long double rho=subproblem_.muEq;
+      for (size_t row=0; row<components.size(); ++row) {
+        const long double h=components[row].value,dh=components[row].increment;
+        result.inheritedError += MeritIncrementError(components[row],subproblem_.lambdaEq[i](row),rho);
+        result.add(-static_cast<long double>(subproblem_.lambdaEq[i](row))*dh);
+        result.add(-rho*h*dh);
+        result.add(-0.5L*rho*dh*dh);
+      }
+    }
+    for (size_t i=0; i<problem_.iConstraints().size(); ++i) {
+      const auto* quadratic = dynamic_cast<const QuadraticInequalityConstraintFactor*>(problem_.iConstraints()[i].get());
+      const auto component = quadratic
+          ? QuadraticIncrement(quadratic->quadraticConstraint(),before,after)
+          : LinearIncrement(dynamic_cast<const LinearInequalityConstraintFactor*>(problem_.iConstraints()[i].get())->linearConstraint(),before,after).at(0);
+      const long double g=component.value,dg=component.increment;
+      const long double rho = subproblem_.muIneq;
+      result.inheritedError += MeritIncrementError(component,subproblem_.lambdaIneq[i],rho);
+      const long double shifted = subproblem_.lambdaIneq[i] + rho*g;
+      const long double next = shifted + rho*dg;
+      if (shifted>0.L && next>0.L) {
+        result.add(-shifted*dg);
+        result.add(-0.5L*rho*dg*dg);
+      } else {
+        const long double oldPositive = std::max(0.L,shifted);
+        const long double newPositive = std::max(0.L,next);
+        result.add((oldPositive-newPositive)*(oldPositive+newPositive)/(2.L*rho));
+      }
+    }
+    return result;
+  }
+
+ public:
+  StableQcqpLM(const NonlinearFactorGraph& graph, const Values& values,
+               const LevenbergMarquardtParams& params,
+               const ConstrainedOptProblem& problem,
+               const AugmentedLagrangianState& subproblem)
+      : LevenbergMarquardtOptimizer(graph,values,params),
+        problem_(problem), subproblem_(subproblem) {}
+
+  GaussianFactorGraph::shared_ptr iterate() override {
+    auto linear = linearize();
+    const bool useMultifrontal = ensureMultifrontalSolver(params_, state_->values);
+    if (useMultifrontal) nonlinearMultifrontalSolver_->load(*linear);
+    VectorValues diagonal;
+    if (params_.dampingParams.diagonalDamping && !useMultifrontal) {
+      diagonal = linear->hessianDiagonal();
+      for (auto& entry : diagonal)
+        entry.second = entry.second.cwiseMax(params_.dampingParams.minDiagonal)
+            .cwiseMin(params_.dampingParams.maxDiagonal).cwiseSqrt();
+    }
+    auto* state = static_cast<internal::LevenbergMarquardtState*>(state_.get());
+    while (true) {
+      const double triedLambda = state->lambda;
+      bool solved = false, accepted = false;
+      MeritDifference predicted, actual;
+      Values next;
+      try {
+        VectorValues proposed;
+        if (useMultifrontal) {
+          nonlinearMultifrontalSolver_->eliminateInPlace(triedLambda);
+          proposed = nonlinearMultifrontalSolver_->updateSolution();
+        } else {
+          proposed = solve(buildDampedSystem(*linear,diagonal),params_);
+        }
+        // A solved cap direction may overshoot the nonlinear merit. Try
+        // bounded fractions of that same direction from the same base point.
+        // Keep the original full-step prediction gate, merit and tolerances.
+        const double directionalDerivative =
+            triedLambda >= params_.lambdaUpperBound
+                ? linear->gradientAtZero().dot(proposed) : 0.0;
+        const bool capDescent = triedLambda >= params_.lambdaUpperBound &&
+            std::isfinite(directionalDerivative) && directionalDerivative < 0.0;
+        for (size_t contractions = 0; ; ++contractions) {
+          solved = false;
+          predicted = MeritDifference{};
+          actual = MeritDifference{};
+          const VectorValues trial = contractions == 0
+              ? proposed : std::ldexp(1.0, -int(contractions)) * proposed;
+          next = state->values.retract(trial);
+          const VectorValues realized = state->values.localCoordinates(next);
+          const double stepNorm = realized.norm();
+          if (stepNorm > 0.0 && std::isfinite(stepNorm)) {
+            solved = true;
+            for (const auto& factor : *linear) {
+              if (!factor) continue;
+              const auto local = HessianReduction(HessianFactor(*factor),realized);
+              predicted.add(local.reduction);
+              predicted.arithmeticScale += local.arithmeticScale;
+            }
+            if (predicted.positive()) {
+              actual = actualReduction(state->values,next,realized);
+              accepted = actual.positive() &&
+                  actual.reduction/predicted.reduction>params_.minModelFidelity;
+            }
+          }
+          if (accepted || !capDescent || !solved || contractions == 64 ||
+              (contractions == 0 && !predicted.positive())) break;
+        }
+      } catch (const IndeterminateSystemException&) {
+        solved = false;
+      }
+      if (params_.verbosityLM>=LevenbergMarquardtParams::TRYLAMBDA)
+        std::cout << std::setprecision(17) << "stable_qcqp lambda=" << triedLambda
+          << " solved=" << solved << " predicted=" << predicted.reduction
+          << " actual=" << actual.reduction << " accepted=" << accepted << std::endl;
+      if (accepted) {
+        const double newError = graph().error(next);
+        if (!std::isfinite(newError)) return linear;
+        state_ = state->decreaseLambda(params_,
+            static_cast<double>(actual.reduction/predicted.reduction),
+            std::move(next),newError);
+        return linear;
+      }
+      // A rejected cap attempt exhausts the search. Otherwise clamp the next
+      // attempt to the cap, so the configured boundary is actually tried.
+      if (triedLambda>=params_.lambdaUpperBound) return linear;
+      state->increaseLambda(params_);
+      // Repeated successful decreases may underflow damping to zero. A
+      // refused undamped step then needs the configured positive seed;
+      // multiplying zero cannot resume the bounded damping search.
+      if (triedLambda == 0.0 && state->lambda == 0.0 &&
+          std::isfinite(params_.lambdaInitial) && params_.lambdaInitial > 0.0) {
+        state->lambda = params_.lambdaInitial;
+      }
+      state->lambda = std::min(state->lambda,params_.lambdaUpperBound);
+      if (!(state->lambda>triedLambda)) return linear;
+    }
   }
 };
 
@@ -188,12 +645,15 @@ struct Diagnostics {
 
 /* ************************************************************************* */
 double InfinityNorm(const Vector& vector) {
+  RequireFinite(vector);
   return vector.size() == 0 ? 0.0 : vector.cwiseAbs().maxCoeff();
 }
 
 /* ************************************************************************* */
 double AugmentedLagrangianStationarity(const NonlinearFactorGraph& graph,
                                        const Values& values) {
+  // A finite reduced gradient cannot certify a nonfinite merit value.
+  RequireFinite(graph.error(values));
   const VectorValues gradient = graph.linearize(values)->gradientAtZero();
   double infinityNorm = 0.0;
   for (const auto& keyGradient : gradient) {
@@ -207,6 +667,8 @@ Diagnostics EvaluateDiagnostics(const ConstrainedOptProblem& problem,
                                 const Values& values,
                                 const AugmentedLagrangianState& subproblem) {
   Diagnostics diagnostics;
+  RequireFinite(subproblem.muEq);
+  RequireFinite(subproblem.muIneq);
 
   // Equality feasibility contributes ||h(x)||_inf to theta.
   for (const auto& constraint : problem.eConstraints()) {
@@ -219,14 +681,21 @@ Diagnostics EvaluateDiagnostics(const ConstrainedOptProblem& problem,
   for (size_t i = 0; i < inequalities.size(); ++i) {
     const double expression = inequalities.at(i)->whitenedExpr(values)(0);
     const double lambda = subproblem.lambdaIneq.at(i);
+    RequireFinite(expression);
+    RequireFinite(lambda);
 
     // q=max(g,-lambda/rho) makes the projected multiplier update
     // lambda^+=max(0,lambda+rho*g)=lambda+rho*q. Thus q=0 encodes primal
     // feasibility and complementarity, including inactive inequalities.
-    const double projectedResidual =
-        std::max(expression, -lambda / subproblem.muIneq);
-    const double projectedLambda =
-        std::max(0.0, lambda + subproblem.muIneq * expression);
+    const double lowerBound = -lambda / subproblem.muIneq;
+    RequireFinite(lowerBound);
+    const double projectedResidual = std::max(expression, lowerBound);
+    const double shifted = lambda + subproblem.muIneq * expression;
+    RequireFinite(shifted);
+    const double projectedLambda = std::max(0.0, shifted);
+    RequireFinite(projectedResidual);
+    const double complementarity = projectedLambda * expression;
+    RequireFinite(complementarity);
 
     // BCL accepts a multiplier update using
     // theta=max(||h||_inf,||q||_inf), not merely max(g,0).
@@ -237,7 +706,7 @@ Diagnostics EvaluateDiagnostics(const ConstrainedOptProblem& problem,
     diagnostics.primalInequalityViolation = std::max(
         diagnostics.primalInequalityViolation, std::max(0.0, expression));
     diagnostics.complementarity = std::max(
-        diagnostics.complementarity, std::abs(projectedLambda * expression));
+        diagnostics.complementarity, std::abs(complementarity));
   }
 
   return diagnostics;
@@ -303,7 +772,8 @@ AugmentedLagrangianOptimizer::iterate(const State& state, double muEq,
                                       double muIneq) const {
   // Validate the fixed-parameter augmented-Lagrangian subproblem.
   validateConfiguration();
-  if (muEq <= 0.0 || muIneq <= 0.0) {
+  if (!std::isfinite(muEq) || !std::isfinite(muIneq) ||
+      muEq <= 0.0 || muIneq <= 0.0) {
     throw std::invalid_argument("ALM direct penalties must be positive");
   }
   if (p_->updatePolicy == AugmentedLagrangianUpdatePolicy::BCL &&
@@ -346,8 +816,10 @@ AugmentedLagrangianOptimizer::iterate(const State& state, double muEq,
   // LM from x_k. Multiplier updates happen only after x_{k+1} is available.
   const NonlinearFactorGraph augmentedLagrangian =
       augmentedLagrangianFunction(subproblemState);
-  const SharedOptimizer optimizer =
-      createUnconstrainedOptimizer(augmentedLagrangian, state.values);
+  const SharedOptimizer optimizer = ExactQcqpMerit(problem_)
+      ? std::make_shared<StableQcqpLM>(augmentedLagrangian, state.values,
+                                     p_->lmParams, problem_, subproblemState)
+      : createUnconstrainedOptimizer(augmentedLagrangian, state.values);
 
   double stationarity =
       AugmentedLagrangianStationarity(augmentedLagrangian, optimizer->values());
@@ -355,6 +827,10 @@ AugmentedLagrangianOptimizer::iterate(const State& state, double muEq,
     // The paper stops its projected inner solve when the projected gradient is
     // at most omega_k. Because this implementation substitutes unconstrained
     // LM, it uses s_k=||grad_x L_rho(x,lambda_k)||_inf <= omega_k.
+    // Solving more tightly than the declared terminal stationarity target
+    // can exhaust finite precision before feasibility can be improved.
+    subproblemState.bclOmega = std::max(
+        subproblemState.bclOmega, p_->absoluteStationarityTolerance);
     while (stationarity > subproblemState.bclOmega &&
            optimizer->iterations() < p_->lmParams.maxIterations) {
       const size_t previousIterations = optimizer->iterations();
@@ -378,10 +854,14 @@ AugmentedLagrangianOptimizer::iterate(const State& state, double muEq,
   State solvedState = subproblemState;
   solvedState.iteration = state.iteration + 1;
   solvedState.setValues(optimizer->values(), problem_);
+  RequireFinite(solvedState.cost);
+  RequireFinite(solvedState.eqConstraintViolation);
+  RequireFinite(solvedState.ineqConstraintViolation);
   solvedState.unconstrainedIterations = optimizer->iterations();
   solvedState.totalUnconstrainedIterations =
       state.totalUnconstrainedIterations + solvedState.unconstrainedIterations;
   solvedState.augmentedLagrangianStationarity = stationarity;
+  solvedState.innerStationarityTolerance = subproblemState.bclOmega;
   const Diagnostics diagnostics =
       EvaluateDiagnostics(problem_, solvedState.values, subproblemState);
   solvedState.generalizedConstraintViolation =
@@ -425,8 +905,9 @@ AugmentedLagrangianOptimizer::iterate(const State& state, double muEq,
         for (size_t i = 0; i < problem_.iConstraints().size(); ++i) {
           const double expression = problem_.iConstraints().at(i)->whitenedExpr(
               solvedState.values)(0);
-          solvedState.lambdaIneq.at(i) =
-              std::max(0.0, solvedState.lambdaIneq.at(i) + muEq * expression);
+          const double shifted = solvedState.lambdaIneq.at(i) + muEq * expression;
+          RequireFinite(shifted);
+          solvedState.lambdaIneq.at(i) = std::max(0.0, shifted);
         }
         solvedState.updateType = AugmentedLagrangianUpdateType::Multiplier;
 
@@ -448,6 +929,15 @@ AugmentedLagrangianOptimizer::iterate(const State& state, double muEq,
     }
   }
 
+  for (const Vector& multiplier : solvedState.lambdaEq) {
+    InfinityNorm(multiplier);
+  }
+  for (double multiplier : solvedState.lambdaIneq) {
+    RequireFinite(multiplier);
+  }
+  RequireFinite(nextMuEq);
+  RequireFinite(nextMuIneq);
+
   solvedState.time =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
           .count();
@@ -461,7 +951,18 @@ Values AugmentedLagrangianOptimizer::optimize() const {
 
   // Construct the initial primal-dual state with zero multipliers.
   State state(0, initialValues_, problem_);
+  RequireFinite(state.cost);
+  RequireFinite(state.eqConstraintViolation);
+  RequireFinite(state.ineqConstraintViolation);
   state.initializeLagrangeMultipliers(problem_);
+  if (!p_->initialInequalityMultipliers.empty()) {
+    if (p_->initialInequalityMultipliers.size() != state.lambdaIneq.size() ||
+        !std::all_of(p_->initialInequalityMultipliers.begin(),
+                     p_->initialInequalityMultipliers.end(),
+                     [](double value) { return std::isfinite(value) && value >= 0.0; }))
+      throw std::invalid_argument("initial inequality multipliers do not match constraints");
+    state.lambdaIneq = p_->initialInequalityMultipliers;
+  }
 
   double muEq = p_->initialMuEq;
   double muIneq = p_->initialMuIneq;
@@ -482,11 +983,15 @@ Values AugmentedLagrangianOptimizer::optimize() const {
     std::tie(state, muEq, muIneq) = iterate(previousState, muEq, muIneq);
 
     if (p_->updatePolicy == AugmentedLagrangianUpdatePolicy::BCL) {
-      state.converged = state.innerConverged &&
-                        state.augmentedLagrangianStationarity <=
-                            p_->absoluteStationarityTolerance &&
-                        state.generalizedConstraintViolation <=
-                            p_->absoluteViolationTolerance;
+      // Inner convergence describes whether LM met the current BCL
+      // subproblem schedule. The final KKT residuals can meet their declared
+      // absolute tolerances even when that schedule has tightened further
+      // than the required solution accuracy.
+      state.converged =
+          state.augmentedLagrangianStationarity <=
+              p_->absoluteStationarityTolerance &&
+          state.generalizedConstraintViolation <=
+              p_->absoluteViolationTolerance;
     } else {
       state.converged = AggressiveConverged(state, previousState, *p_);
     }
@@ -505,7 +1010,8 @@ Values AugmentedLagrangianOptimizer::optimize() const {
 NonlinearFactorGraph AugmentedLagrangianOptimizer::augmentedLagrangianFunction(
     const State& state, double /*epsilon*/) const {
   validateConfiguration();
-  if (state.muEq <= 0.0 || state.muIneq <= 0.0) {
+  if (!std::isfinite(state.muEq) || !std::isfinite(state.muIneq) ||
+      state.muEq <= 0.0 || state.muIneq <= 0.0) {
     throw std::invalid_argument("ALM direct penalties must be positive");
   }
   if (state.lambdaEq.size() != problem_.eConstraints().size() ||
@@ -524,8 +1030,10 @@ NonlinearFactorGraph AugmentedLagrangianOptimizer::augmentedLagrangianFunction(
   const auto& equalities = problem_.eConstraints();
   for (size_t i = 0; i < equalities.size(); ++i) {
     const auto& constraint = equalities.at(i);
+    InfinityNorm(state.lambdaEq.at(i));
     Vector bias = state.lambdaEq.at(i) / state.muEq;
     bias = bias.cwiseProduct(constraint->sigmas());
+    InfinityNorm(bias);
     graph.emplace_shared<BiasedFactor>(constraint->penaltyFactor(state.muEq),
                                        bias);
   }
@@ -535,6 +1043,10 @@ NonlinearFactorGraph AugmentedLagrangianOptimizer::augmentedLagrangianFunction(
   // term only by the x-independent constant lambda^2/(2 rho).
   const auto& inequalities = problem_.iConstraints();
   for (size_t i = 0; i < inequalities.size(); ++i) {
+    RequireFinite(state.lambdaIneq.at(i));
+    if (state.lambdaIneq.at(i) < 0.0) {
+      throw std::invalid_argument("ALM inequality multipliers must be nonnegative");
+    }
     graph.emplace_shared<PhrInequalityFactor>(
         inequalities.at(i), state.lambdaIneq.at(i), state.muIneq);
   }
@@ -568,8 +1080,10 @@ void AugmentedLagrangianOptimizer::updateLagrangeMultiplier(
     const double stepSize =
         std::min(p_->maxDualStepSizeIneq,
                  subproblemState.muIneq * p_->dualStepSizeFactorIneq);
-    solvedState->lambdaIneq.at(i) =
-        std::max(0.0, subproblemState.lambdaIneq.at(i) + stepSize * violation);
+    const double shifted =
+        subproblemState.lambdaIneq.at(i) + stepSize * violation;
+    RequireFinite(shifted);
+    solvedState->lambdaIneq.at(i) = std::max(0.0, shifted);
   }
 }
 

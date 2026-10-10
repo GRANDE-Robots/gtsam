@@ -1684,6 +1684,54 @@ TEST(QcqpProblem, FromQcqpValueRequiresExactDimensions) {
 }  // namespace QcqpExtractionFixture
 
 /* ************************************************************************* */
+namespace quadratic_cancellation_tests {
+
+// Verifies exact cancellation is evaluated before rounding products to double.
+TEST(QuadraticConstraint, PreservesFeasibleCancellation) {
+  const Vector value{{134217729.0, 134217728.0}};
+  Matrix A = Matrix::Zero(2, 2);
+  A(0, 0) = 1.0;
+  A(1, 1) = -1.0;
+  Values values;
+  values.insert(0, value);
+  const auto factor =
+      QuadraticConstraint::Equal(0, A, 268435457.0).createEqualityFactor();
+  EXPECT_DOUBLES_EQUAL(0.0, factor->unwhitenedError(values)(0), 0.0);
+}
+
+// Verifies a unit residual and its inequality sign survive cancellation.
+TEST(QuadraticConstraint, PreservesSignedUnitResidual) {
+  const Vector value{{134217729.0, 134217728.0}};
+  Matrix A = Matrix::Zero(2, 2);
+  A(0, 0) = 1.0;
+  A(1, 1) = -1.0;
+  Values values;
+  values.insert(0, value);
+  const auto equality =
+      QuadraticConstraint::Equal(0, A, 268435456.0).createEqualityFactor();
+  const auto inequality =
+      QuadraticConstraint::GreaterEqual(0, A, 268435456.0)
+          .createInequalityFactor();
+  EXPECT_DOUBLES_EQUAL(1.0, equality->unwhitenedError(values)(0), 0.0);
+  EXPECT_DOUBLES_EQUAL(-1.0, inequality->unwhitenedExpr(values)(0), 0.0);
+}
+
+// Verifies cancellation cannot hide a small infeasible residual at large scale.
+TEST(QuadraticConstraint, RetainsResidualAcrossWideScaleCancellation) {
+  const Vector value{{1e100, 1e100}};
+  Matrix A = Matrix::Zero(2, 2);
+  A(0, 0) = 1.0;
+  A(1, 1) = -1.0;
+  Values values;
+  values.insert(0, value);
+  const auto factor =
+      QuadraticConstraint::Equal(0, A, 1.0).createEqualityFactor();
+  EXPECT_DOUBLES_EQUAL(-1.0, factor->unwhitenedError(values)(0), 0.0);
+}
+
+}  // namespace quadratic_cancellation_tests
+/* ************************************************************************* */
+
 int main() {
   TestResult tr;
   return TestRegistry::runAllTests(tr);

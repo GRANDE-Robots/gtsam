@@ -86,6 +86,10 @@ class GTSAM_EXPORT AugmentedLagrangianParams : public PenaltyOptimizerParams {
   /// BCL beta_eta exponent used when tightening eta.
   double bclBetaEta = 0.9;
 
+  /// Optional nonnegative seeds in the current scalar-inequality order.
+  /// Empty preserves zero initialization. These seed the solver, not the model.
+  std::vector<double> initialInequalityMultipliers;
+
   using Base::Base;
 };
 
@@ -111,6 +115,9 @@ class GTSAM_EXPORT AugmentedLagrangianState : public PenaltyOptimizerState {
   double primalInequalityViolation = 0.0;
   /// Infinity norm of lambda^+ times g for whitened inequalities.
   double complementarity = 0.0;
+
+  /// Actual stationarity tolerance used by this completed inner solve.
+  double innerStationarityTolerance = std::numeric_limits<double>::infinity();
 
   /// Total LM iterations accumulated across all outer iterations.
   size_t totalUnconstrainedIterations = 0;

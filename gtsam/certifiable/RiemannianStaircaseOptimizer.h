@@ -103,6 +103,9 @@ struct GTSAM_EXPORT RiemannianStaircaseParams {
 /**
  * Burer-Monteiro Riemannian Staircase over a QCQP-representable estimation
  * problem (Certi-FGO Algorithm 1).
+ * This implementation currently requires unary quadratic constraints; the
+ * augmented-Lagrangian QCQP optimizer supports multi-key constraints, but the
+ * staircase certificate construction does not.
  *
  * Problem chain (Certi-FGO Sec V; eq. numbers below refer to that paper):
  *   QCQP (eq. 12):  min_{X in R^{r x d}}  <Q, X X'>
