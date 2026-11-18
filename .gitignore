@@ -1,10 +1,50 @@
+# Local environment and editor state
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+/.venv/
+/venv/
+/env/
+/ENV/
+.pypirc
+
+# Python caches and packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+/dist/
+/wheels/
+
+# Local workspace outputs
+/.catkin_tools/
+/build/
+/devel/
+/install/
+/log/
+/logs/
+/outputs/
+
+# Repository-specific exclusions
+# for QtCreator:
 /build
 /build-*/
 /debug*
 .idea
 *.pyc
 *.DS_Store
-*.swp
 *:Zone.Identifier
 /examples/Data/dubrovnik-3-7-pre-rewritten.txt
 /examples/Data/pose2example-rewritten.txt
@@ -14,23 +54,19 @@
 *.txt.user.6d59f0c
 *.pydevproject
 .vscode
-.env
 /.vs/
 vcpkg_installed/
 /CMakeSettings.json
-# for QtCreator:
 CMakeLists.txt.user*
 xcode/
 /Dockerfile
 /python/gtsam/notebooks/.ipynb_checkpoints/ellipses-checkpoint.ipynb
-.cache/
 .venv/
 
 # MyST build outputs
 _build
 doc/#*.lyx#
 /cmake-build-debug/
-.venv/
 conductor/
 .ccache/
 gtsam_unstable/timing/data/

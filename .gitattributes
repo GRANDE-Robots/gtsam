@@ -1,0 +1,18 @@
+* text=auto eol=lf
+
+*.bag binary
+*.db binary
+*.db3 binary
+*.gif binary
+*.jpeg binary
+*.jpg binary
+*.mcap binary
+*.onnx binary
+*.pdf binary
+*.png binary
+*.pt binary
+*.pth binary
+
+# Preserve the checkout policy of upstream-owned trees.
+gtsam/3rdparty/** !binary !text !eol !diff !merge
+wrap/** !binary !text !eol !diff !merge

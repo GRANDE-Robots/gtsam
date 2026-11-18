@@ -273,3 +273,16 @@ Debugging checklist for `CustomFactor`:
   the callback contract is being violated; inspect the callback outputs before suspecting the optimizer.
 - MATLAB crashes or errors while unloading the wrapper:
   remember that creating a MATLAB `CustomFactor` intentionally locks the mex module for the rest of the session.
+
+## File Structure
+
+| File | Relevance | Dependencies | Used by |
+| --- | --- | --- | --- |
+| [+gtsam/](%2Bgtsam/README.md) | Indexes this maintained subfolder. | None | Developers |
+| [CMakeLists.txt](CMakeLists.txt) | Configures this folder's build, installation or validation targets. | CMake | None |
+| [MatlabCustomFactor.h](MatlabCustomFactor.h) | Declares Matlab Custom Factor types or operations. | [CustomFactor.h](../gtsam/nonlinear/CustomFactor.h); C++ standard/system library; `tbb` headers | [matlab/CMakeLists.txt](CMakeLists.txt); [matlab/README.md](README.md); [matlab/custom.i](custom.i) |
+| [README.md](README.md) | Indexes this folder and its maintained subfolders. | None | Developers |
+| [custom.i](custom.i) | Declares custom wrapper interfaces or binding templates. | [MatlabCustomFactor.h](MatlabCustomFactor.h) | [matlab/README.md](README.md) |
+| [gtsam_examples/](gtsam_examples/README.md) | Indexes this maintained subfolder. | None | Developers |
+| [gtsam_tests/](gtsam_tests/README.md) | Indexes this maintained subfolder. | None | Developers |
+| [unstable_examples/](unstable_examples/README.md) | Indexes this maintained subfolder. | None | Developers |

@@ -138,3 +138,12 @@ final-error agreement.
   enabled the scalar loss is already copied to CPU each step (GTSAM also
   evaluates its error every iteration), so `--record-losses` adds no extra
   synchronization; in fixed-step mode (negative tolerance) it does.
+
+## File Structure
+
+| File | Relevance | Dependencies | Used by |
+| --- | --- | --- | --- |
+| [README.md](README.md) | Indexes this folder and its maintained subfolders. | None | Developers |
+| [run_benchmark.py](run_benchmark.py) | Drive time_bal.py over the large Dubrovnik BAL datasets and tabulate results. | Python standard library | [timing/pypose_ba/README.md](README.md) |
+| [setup_env.sh](setup_env.sh) | Runs the setup env shell workflow. | Shell and declared executables | [timing/pypose_ba/README.md](README.md) |
+| [time_bal.py](time_bal.py) | Compare PyPose/BAE sparse bundle adjustment timing with GTSAM timeSFMBAL. | Python standard library; `bae`; `pypose`; `torch` | [timing/pypose_ba/README.md](README.md); [run_benchmark.py](run_benchmark.py) |

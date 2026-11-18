@@ -187,3 +187,17 @@ GTSAM Python wheels are built in CI through two cibuildwheel workflows that shar
 After a successful develop-wheel upload, `.github/workflows/build-cibw.yml` can automatically prune `gtsam-develop` on PyPI. Configure the repository secrets `PYPI_CLEANUP_USERNAME` and `PYPI_CLEANUP_PASSWORD` for a PyPI owner account on `gtsam-develop`; if either secret is missing, the workflow skips cleanup. If that account requires two-factor authentication, also configure the optional base32 TOTP seed as `PYPI_CLEANUP_TOTP_SECRET`. The cleanup keeps the five most recent PyPI releases by upload time and deletes older release versions.
 
 For a manual dry run, install `pypi-cleanup` and run `bash .github/scripts/python_wheels/cleanup_gtsam_develop.sh --dry-run`. To delete manually, run `bash .github/scripts/python_wheels/cleanup_gtsam_develop.sh --keep 5 <username>` and provide the PyPI password when prompted, or set `PYPI_CLEANUP_PASSWORD` in the environment. If needed, set `PYPI_CLEANUP_TOTP_SECRET` to let the script generate the PyPI TOTP code. Treat deletion as permanent cleanup for staying below PyPI's project size limit.
+
+## File Structure
+
+| File | Relevance | Dependencies | Used by |
+| --- | --- | --- | --- |
+| [CMakeLists.txt](CMakeLists.txt) | Configures this folder's build, installation or validation targets. | CMake | None |
+| [CustomFactors.md](CustomFactors.md) | Documents GTSAM Python-based factors. | None | None |
+| [MANIFEST.in](MANIFEST.in) | Selects files included in Python source distributions. | None | [python/CMakeLists.txt](CMakeLists.txt); [compiling.rst](../wrap/pybind11/docs/compiling.rst); [setup_helpers.py](../wrap/pybind11/pybind11/setup_helpers.py) |
+| [README.md](README.md) | Indexes this folder and its maintained subfolders. | None | Developers |
+| [dev_requirements.txt](dev_requirements.txt) | Retains the dev requirements source or configuration file. | None | [cibw_before_all.sh](../.github/scripts/python_wheels/cibw_before_all.sh); [build-cibw.yml](../.github/workflows/build-cibw.yml); [build-python.yml](../.github/workflows/build-python.yml); 4 other source references |
+| [gtsam/](gtsam/README.md) | Indexes this maintained subfolder. | None | Developers |
+| [gtsam_unstable/](gtsam_unstable/README.md) | Indexes this maintained subfolder. | None | Developers |
+| [requirements.txt](requirements.txt) | Retains the requirements source or configuration file. | None | None |
+| [setup.py.in](setup.py.in) | Templates the generated setup.py configuration. | None | [python/CMakeLists.txt](CMakeLists.txt) |

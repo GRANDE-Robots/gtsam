@@ -129,3 +129,13 @@ The **gtsam-vnc** image configuration is available locally in the [`gtsam-vnc`](
 4.  **Connect:**
 
     Use a VNC client to connect to `localhost:5900`.
+
+## File Structure
+
+| File | Relevance | Dependencies | Used by |
+| --- | --- | --- | --- |
+| [Containerfile](Containerfile) | Defines the container image build recipe. | None | None |
+| [README.md](README.md) | Indexes this folder and its maintained subfolders. | None | Developers |
+| [compose.yaml](compose.yaml) | Declares compose parameter or configuration values. | None | None |
+| [gtsam-vnc/](gtsam-vnc/README.md) | Indexes this maintained subfolder. | None | Developers |
+| [hub_push.sh](hub_push.sh) | Runs the hub push shell workflow. | Shell and declared executables | None |

@@ -73,3 +73,47 @@ Defines two useful functions for creating CTest unit tests.  Also immediately cr
     include(GtsamMakeConfigFile)
      
 Defines a function for generating a config file so your project may be found with the CMake `find_package` function.  TODO: Write documentation.
+
+## File Structure
+
+| File | Relevance | Dependencies | Used by |
+| --- | --- | --- | --- |
+| [CMakeLists.txt](CMakeLists.txt) | Configures this folder's build, installation or validation targets. | CMake | None |
+| [Config.cmake.in](Config.cmake.in) | Templates the generated Config.cmake configuration. | None | [cmake/CMakeLists.txt](CMakeLists.txt); [GtsamMakeConfigFile.cmake](GtsamMakeConfigFile.cmake); [HandleCuda.cmake](HandleCuda.cmake); 1 other source references |
+| [FindGooglePerfTools.cmake](FindGooglePerfTools.cmake) | Defines Find Google Perf Tools CMake configuration. | CMake | None |
+| [FindMKL.cmake](FindMKL.cmake) | Defines Find MKL CMake configuration. | CMake | None |
+| [FindMOSEK.cmake](FindMOSEK.cmake) | Defines Find MOSEK CMake configuration. | CMake | None |
+| [FindNumPy.cmake](FindNumPy.cmake) | Defines Find Num Py CMake configuration. | CMake | [cmake/CMakeLists.txt](CMakeLists.txt) |
+| [GTSAMCMakeToolsConfig.cmake](GTSAMCMakeToolsConfig.cmake) | Defines GTSAMCMake Tools Config CMake configuration. | CMake | [cmake/CMakeLists.txt](CMakeLists.txt) |
+| [GtsamBuildTypes.cmake](GtsamBuildTypes.cmake) | Defines Gtsam Build Types CMake configuration. | CMake | [cmake/CMakeLists.txt](CMakeLists.txt) |
+| [GtsamMakeConfigFile.cmake](GtsamMakeConfigFile.cmake) | Defines Gtsam Make Config File CMake configuration. | CMake | [cmake/CMakeLists.txt](CMakeLists.txt) |
+| [GtsamPrinting.cmake](GtsamPrinting.cmake) | Defines Gtsam Printing CMake configuration. | CMake | [cmake/CMakeLists.txt](CMakeLists.txt) |
+| [GtsamTesting.cmake](GtsamTesting.cmake) | Defines Gtsam Testing CMake configuration. | CMake | [cmake/CMakeLists.txt](CMakeLists.txt); [GtsamTestingObsolete.cmake](obsolete/GtsamTestingObsolete.cmake) |
+| [HandleAllocators.cmake](HandleAllocators.cmake) | Defines Handle Allocators CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleBoost.cmake](HandleBoost.cmake) | Defines Handle Boost CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt); [README.md](../README.md) |
+| [HandleCCache.cmake](HandleCCache.cmake) | Defines Handle CCache CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleCPack.cmake](HandleCPack.cmake) | Defines Handle CPack CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleCephes.cmake](HandleCephes.cmake) | Defines Handle Cephes CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleCuda.cmake](HandleCuda.cmake) | Defines Handle Cuda CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt); [gtsam/base/cuda/Errors.h](../gtsam/base/cuda/Errors.h) |
+| [HandleEigen.cmake](HandleEigen.cmake) | Defines Handle Eigen CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleFinalChecks.cmake](HandleFinalChecks.cmake) | Defines Handle Final Checks CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleGeneralOptions.cmake](HandleGeneralOptions.cmake) | Defines Handle General Options CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleGeographicLib.cmake](HandleGeographicLib.cmake) | Defines Handle Geographic Lib CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleGlobalBuildFlags.cmake](HandleGlobalBuildFlags.cmake) | Defines Handle Global Build Flags CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleMKL.cmake](HandleMKL.cmake) | Defines Handle MKL CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleMOSEK.cmake](HandleMOSEK.cmake) | Defines Handle MOSEK CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleMetis.cmake](HandleMetis.cmake) | Defines Handle Metis CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt); [gtsam/3rdparty/CMakeLists.txt](../gtsam/3rdparty/CMakeLists.txt) |
+| [HandleOpenMP.cmake](HandleOpenMP.cmake) | Defines Handle Open MP CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandlePerfTools.cmake](HandlePerfTools.cmake) | Defines Handle Perf Tools CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandlePrintConfiguration.cmake](HandlePrintConfiguration.cmake) | Defines Handle Print Configuration CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandlePython.cmake](HandlePython.cmake) | Defines Handle Python CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleSpectra.cmake](HandleSpectra.cmake) | Defines Handle Spectra CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleSuiteSparse.cmake](HandleSuiteSparse.cmake) | Defines Handle Suite Sparse CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleTBB.cmake](HandleTBB.cmake) | Defines Handle TBB CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [HandleUninstall.cmake](HandleUninstall.cmake) | Defines Handle Uninstall CMake configuration. | CMake | [CMakeLists.txt](../CMakeLists.txt) |
+| [README.html](README.html) | Retains the README source or configuration file. | None | [cmake/CMakeLists.txt](CMakeLists.txt) |
+| [README.md](README.md) | Indexes this folder and its maintained subfolders. | None | Developers |
+| [cmake_uninstall.cmake.in](cmake_uninstall.cmake.in) | Templates the generated cmake_uninstall.cmake configuration. | None | None |
+| [dllexport.h.in](dllexport.h.in) | Templates the generated dllexport.h configuration. | None | [cmake/CMakeLists.txt](CMakeLists.txt); [gtsam/CMakeLists.txt](../gtsam/CMakeLists.txt); [gtsam_unstable/CMakeLists.txt](../gtsam_unstable/CMakeLists.txt) |
+| [example_cmake_find_gtsam/](example_cmake_find_gtsam/README.md) | Indexes this maintained subfolder. | None | Developers |
+| [obsolete/](obsolete/README.md) | Indexes this maintained subfolder. | None | Developers |
